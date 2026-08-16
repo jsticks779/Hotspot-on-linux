@@ -71,6 +71,7 @@ The tool is plain POSIX-ish shell plus `iw`, `hostapd`, `dnsmasq` and
 | Distribution | Package manager | Status |
 |---|---|---|
 | Ubuntu 24.04 | `apt` | Tested end to end |
+| Kali Rolling (kernel 6.19) | `apt` | Tested end to end |
 | Debian, Mint, Pop!_OS, elementary | `apt` | Same packages and paths; expected to work |
 | Fedora, RHEL, CentOS, Rocky | `dnf` / `yum` | Expected to work; see the firewalld note below |
 | Arch, Manjaro, EndeavourOS | `pacman` | Expected to work |
@@ -78,9 +79,15 @@ The tool is plain POSIX-ish shell plus `iw`, `hostapd`, `dnsmasq` and
 | Alpine | `apk` | CLI works; no systemd, so no service or desktop toggle |
 
 Being honest about "expected to work": the code paths are there and the commands
-are standard, but only Ubuntu 24.04 has been run end to end. If you try another
+are standard, but only Ubuntu 24.04 and Kali Rolling have been run end to end —
+both `apt`-based. The `dnf`, `pacman`, `zypper` and `apk` branches are written
+from documented behaviour and have not been executed. If you try another
 distribution, `sudo linux-hotspot doctor` plus an issue report is genuinely
 useful.
+
+The Kali run is worth noting because nothing about it was hard-coded: its
+wireless interface is `wlan0` rather than `wlp2s0`, and detection picked it up
+without any configuration.
 
 ### Distribution-specific notes
 
