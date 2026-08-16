@@ -1,0 +1,18 @@
+[Unit]
+Description=Wi-Fi hotspot (linux-hotspot)
+Documentation=https://github.com/jsticks779/Hotspot-on-linux
+# NetworkManager brings the client link up; without it there is no channel to
+# follow and no route to share, so start after it wherever it exists.
+After=network.target NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/linux-hotspot up
+ExecStop=/usr/local/bin/linux-hotspot down
+# `up` waits up to 25s for the Wi-Fi to associate, and hostapd is retried a few
+# times when the radio is busy, so allow a generous window before giving up.
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

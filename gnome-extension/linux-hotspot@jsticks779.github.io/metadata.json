@@ -1,0 +1,8 @@
+{
+  "uuid": "linux-hotspot@jsticks779.github.io",
+  "name": "Linux Hotspot",
+  "description": "Quick-settings toggle for linux-hotspot, with a password editor. Turns the hotspot on and off without a password prompt.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "url": "https://github.com/jsticks779/Hotspot-on-linux",
+  "version": 1
+}

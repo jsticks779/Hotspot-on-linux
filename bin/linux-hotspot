@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+#
+# linux-hotspot — share your internet over Wi-Fi, even when the internet you
+# are sharing arrives over that same Wi-Fi card.
+#
+# https://github.com/jsticks779/Hotspot-on-linux
+#
+# Licensed under the MIT license.
+
+set -uo pipefail
+
+VERSION=1.0.0
+
+# ---------------------------------------------------------------- constants --
+CONF_DIR=/etc/linux-hotspot
+CONF="$CONF_DIR/hotspot.conf"
+RUN_CONF=/run/linux-hotspot-hostapd.conf
+HOSTAPD_PID=/run/linux-hotspot-hostapd.pid
+DNSMASQ_PID=/run/linux-hotspot-dnsmasq.pid
+FORWARD_SAVE=/run/linux-hotspot.ip_forward
+LEASES=/var/lib/misc/linux-hotspot.leases
+NFT_TABLE=linux_hotspot
+
+# ----------------------------------------------------------------- defaults --
+# Every one of these can be overridden in /etc/linux-hotspot/hotspot.conf
+SSID="linux-hotspot"
+PASSPHRASE=""
+SECURITY="wpa2"          # wpa2 | wpa3 | mixed
+AP_IFACE="ap0"
+AP_MAC=""                # empty: inherit the card's MAC
+STA_IFACE=""             # empty: auto-detect
+UPLINK_IFACE=""          # empty: auto-detect (the default route)
+CHANNEL=""               # empty: auto (forced to the client channel when sharing Wi-Fi)
+COUNTRY=""               # empty: auto from the regulatory domain
+IPV4_NET="10.42.0"       # a /24; the host takes .1
+DHCP_FIRST=10
+DHCP_LAST=100
+DNS_SERVERS="1.1.1.1,8.8.8.8"
+HIDDEN=0
+
+# ------------------------------------------------------------------- output --
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+else
+    C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_DIM=""; C_BOLD=""
+fi
+
+log()  { echo "${C_BLUE}::${C_RESET} $*"; logger -t linux-hotspot -- "$*" 2>/dev/null || true; }
+warn() { echo "${C_YELLOW}warning:${C_RESET} $*" >&2; logger -t linux-hotspot -- "warning: $*" 2>/dev/null || true; }
+die()  { echo "${C_RED}error:${C_RESET} $*" >&2; logger -t linux-hotspot -- "error: $*" 2>/dev/null || true; exit 1; }
+ok()   { echo "${C_GREEN}✓${C_RESET} $*"; }
+bad()  { echo "${C_RED}✗${C_RESET} $*"; }
+meh()  { echo "${C_YELLOW}!${C_RESET} $*"; }
+
+need_root() { [ "$(id -u)" = 0 ] || die "this command needs root — try: sudo linux-hotspot $*"; }
+
+# ------------------------------------------------------------ configuration --
+# Parsed rather than sourced: the file is writable by the desktop user so the
+# GNOME toggle can edit it, and that must never become a way to run code as root.
+load_conf() {
+    [ -r "$CONF" ] || return 0
+    local key val
+    while IFS='=' read -r key val; do
+        val=${val%$'\r'}
+        val=${val#\"}; val=${val%\"}
+        val=${val#\'}; val=${val%\'}
+        case "$key" in
+            SSID|PASSPHRASE|SECURITY|AP_IFACE|AP_MAC|STA_IFACE|UPLINK_IFACE|\
+            CHANNEL|COUNTRY|IPV4_NET|DHCP_FIRST|DHCP_LAST|DNS_SERVERS|HIDDEN)
+                printf -v "$key" '%s' "$val" ;;
+        esac
+    done < <(grep -E '^[A-Z_]+=' "$CONF" 2>/dev/null)
+}
+
+write_conf() {
+    mkdir -p "$CONF_DIR"
+    local tmp="$CONF.tmp.$$"
+    cat > "$tmp" <<EOF
+# linux-hotspot configuration — see \`linux-hotspot help\` and the project docs.
+# Anything left commented out is detected automatically at start time.
+
+SSID=$SSID
+PASSPHRASE=$PASSPHRASE
+
+# wpa2 (works everywhere) | wpa3 (modern devices only) | mixed
+SECURITY=$SECURITY
+
+# Force settings only if auto-detection picks the wrong thing:
+#STA_IFACE=wlan0
+#UPLINK_IFACE=eth0
+#AP_IFACE=ap0
+#AP_MAC=02:11:22:33:44:55
+#CHANNEL=6
+#COUNTRY=US
+#IPV4_NET=10.42.0
+#DNS_SERVERS=1.1.1.1,8.8.8.8
+#HIDDEN=0
+EOF
+    chmod 0660 "$tmp"
+    mv "$tmp" "$CONF"
+    # The desktop user needs write access for the quick-settings password editor.
+    local owner
+    owner=$(stat -c '%G' "$CONF_DIR" 2>/dev/null)
+    [ -n "$owner" ] && chgrp "$owner" "$CONF" 2>/dev/null
+    return 0
+}
+
+# -------------------------------------------------------------- detection ----
+wifi_ifaces() { iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'; }
+
+iface_type() { iw dev "$1" info 2>/dev/null | awk '$1=="type"{print $2}'; }
+
+detect_sta() {
+    if [ -n "$STA_IFACE" ]; then echo "$STA_IFACE"; return 0; fi
+    local i
+    # prefer a card that is actually associated with a network
+    for i in $(wifi_ifaces); do
+        [ "$i" = "$AP_IFACE" ] && continue
+        if iw dev "$i" link 2>/dev/null | grep -q "^Connected to"; then
+            echo "$i"; return 0
+        fi
+    done
+    for i in $(wifi_ifaces); do
+        [ "$i" = "$AP_IFACE" ] && continue
+        if [ "$(iface_type "$i")" = "managed" ]; then echo "$i"; return 0; fi
+    done
+    return 1
+}
+
+detect_uplink() {
+    if [ -n "$UPLINK_IFACE" ]; then echo "$UPLINK_IFACE"; return 0; fi
+    ip route show default 2>/dev/null | awk '/^default/{print $5; exit}'
+}
+
+sta_phy()     { iw dev "$1" info 2>/dev/null | awk '$1=="wiphy"{print "phy"$2}'; }
+sta_channel() { iw dev "$1" info 2>/dev/null | awk '$1=="channel"{print $2}'; }
+sta_freq()    { iw dev "$1" info 2>/dev/null | awk '$1=="channel"{gsub(/[()]/,"",$3); print $3}'; }
+
+detect_country() {
+    if [ -n "$COUNTRY" ]; then echo "$COUNTRY"; return 0; fi
+    local c
+    c=$(iw reg get 2>/dev/null | awk '/^country/{gsub(":","",$2); print $2; exit}')
+    if [ -n "$c" ] && [ "$c" != "00" ]; then echo "$c"; return 0; fi
+    echo "US"
+}
+
+phy_supports_ap() { iw phy "$1" info 2>/dev/null | grep -qE '^[[:space:]]*\* AP$'; }
+
+# The "valid interface combinations" block says what the driver will run at the
+# same time. Each combination can wrap onto a second line, so glue them back
+# into one line each before anybody tries to read them.
+phy_combinations() {
+    iw phy "$1" info 2>/dev/null | awk '
+        /valid interface combinations/ { inblock = 1; next }
+        inblock && /^\t[^\t]/          { exit }
+        inblock {
+            gsub(/^[ \t]+/, "")
+            if ($0 ~ /^\*/) { if (line != "") print line; line = $0 }
+            else            { line = line " " $0 }
+        }
+        END { if (line != "") print line }
+    '
+}
+
+# The combination that mentions AP, if the driver offers one at all.
+phy_ap_combination() { phy_combinations "$1" | grep -m1 '\bAP\b'; }
+
+fw_backend() {
+    if command -v iptables >/dev/null 2>&1 && iptables -t nat -S >/dev/null 2>&1; then
+        echo iptables
+    elif command -v nft >/dev/null 2>&1; then
+        echo nft
+    else
+        echo none
+    fi
+}
+
+# --------------------------------------------------------------- firewall ----
+firewall_up() {
+    local sta=$1 net="$IPV4_NET.0/24" backend
+    backend=$(fw_backend)
+
+    if [ ! -f "$FORWARD_SAVE" ]; then
+        sysctl -n net.ipv4.ip_forward > "$FORWARD_SAVE" 2>/dev/null || echo 0 > "$FORWARD_SAVE"
+    fi
+    sysctl -qw net.ipv4.ip_forward=1
+
+    case "$backend" in
+        iptables)
+            iptables -t nat -C POSTROUTING -s "$net" -o "$sta" -j MASQUERADE 2>/dev/null || \
+                iptables -t nat -A POSTROUTING -s "$net" -o "$sta" -j MASQUERADE
+            iptables -C FORWARD -i "$AP_IFACE" -o "$sta" -j ACCEPT 2>/dev/null || \
+                iptables -I FORWARD 1 -i "$AP_IFACE" -o "$sta" -j ACCEPT
+            iptables -C FORWARD -i "$sta" -o "$AP_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+                iptables -I FORWARD 1 -i "$sta" -o "$AP_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+            # keep TCP inside the tunnel-ish MTU of whatever the uplink is
+            iptables -t mangle -C FORWARD -o "$sta" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+                iptables -t mangle -A FORWARD -o "$sta" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+            ;;
+        nft)
+            nft delete table ip "$NFT_TABLE" 2>/dev/null
+            nft add table ip "$NFT_TABLE"
+            nft add chain ip "$NFT_TABLE" postrouting "{ type nat hook postrouting priority 100 ; }"
+            nft add rule  ip "$NFT_TABLE" postrouting ip saddr "$net" oifname "$sta" masquerade
+            nft add chain ip "$NFT_TABLE" forward "{ type filter hook forward priority -10 ; }"
+            nft add rule  ip "$NFT_TABLE" forward iifname "$AP_IFACE" oifname "$sta" accept
+            nft add rule  ip "$NFT_TABLE" forward iifname "$sta" oifname "$AP_IFACE" ct state related,established accept
+            ;;
+        *)
+            warn "no iptables or nft found — clients will associate but get no internet"
+            ;;
+    esac
+}
+
+firewall_down() {
+    local sta=$1 net="$IPV4_NET.0/24"
+    case "$(fw_backend)" in
+        iptables)
+            iptables -t nat -D POSTROUTING -s "$net" -o "$sta" -j MASQUERADE 2>/dev/null
+            iptables -D FORWARD -i "$AP_IFACE" -o "$sta" -j ACCEPT 2>/dev/null
+            iptables -D FORWARD -i "$sta" -o "$AP_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+            iptables -t mangle -D FORWARD -o "$sta" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+            ;;
+        nft)
+            nft delete table ip "$NFT_TABLE" 2>/dev/null
+            ;;
+    esac
+    if [ -f "$FORWARD_SAVE" ]; then
+        sysctl -qw "net.ipv4.ip_forward=$(cat "$FORWARD_SAVE")" 2>/dev/null
+        rm -f "$FORWARD_SAVE"
+    fi
+    return 0
+}
+
+# ----------------------------------------------------------------- hostapd ---
+write_hostapd_conf() {
+    local chan=$1 hw=$2
+    {
+        echo "interface=$AP_IFACE"
+        echo "driver=nl80211"
+        echo "ctrl_interface=/run/hostapd"
+        echo "ssid=$SSID"
+        echo "country_code=$(detect_country)"
+        echo "ieee80211d=1"
+        echo "hw_mode=$hw"
+        echo "channel=$chan"
+        # Deliberately 20 MHz: asking for HT40 makes hostapd run a coexistence
+        # scan, and on a single radio that scan fights the client link and dies
+        # with EBUSY. Bandwidth is rarely the bottleneck when re-sharing Wi-Fi.
+        echo "ieee80211n=1"
+        [ "$hw" = "a" ] && { echo "ieee80211ac=1"; echo "vht_oper_chwidth=0"; }
+        echo "wmm_enabled=1"
+        echo "auth_algs=1"
+        echo "macaddr_acl=0"
+        echo "ignore_broadcast_ssid=$HIDDEN"
+        echo "wpa=2"
+        echo "rsn_pairwise=CCMP"
+        case "$SECURITY" in
+            wpa3)
+                echo "wpa_key_mgmt=SAE"
+                echo "ieee80211w=2"
+                echo "sae_password=$PASSPHRASE"
+                ;;
+            mixed)
+                echo "wpa_key_mgmt=WPA-PSK SAE"
+                echo "ieee80211w=1"
+                echo "sae_password=$PASSPHRASE"
+                echo "wpa_passphrase=$PASSPHRASE"
+                ;;
+            *)
+                echo "wpa_key_mgmt=WPA-PSK"
+                echo "wpa_passphrase=$PASSPHRASE"
+                ;;
+        esac
+    } > "$RUN_CONF"
+    chmod 600 "$RUN_CONF"
+}
+
+# hostapd -B forks before the radio is really up, so its exit status proves
+# nothing. The interface advertising an SSID is the only honest success signal.
+wait_for_beacon() {
+    local i
+    for i in $(seq 1 12); do
+        iw dev "$AP_IFACE" info 2>/dev/null | grep -q "^[[:space:]]*ssid " && return 0
+        if [ -f "$HOSTAPD_PID" ] && ! kill -0 "$(cat "$HOSTAPD_PID")" 2>/dev/null; then
+            return 1
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+# Bringing the AP up races the client link's background scans and comes back
+# EBUSY often enough that a single attempt is not good enough.
+start_hostapd() {
+    local attempt
+    for attempt in 1 2 3 4; do
+        hostapd -B -P "$HOSTAPD_PID" "$RUN_CONF"
+        wait_for_beacon && return 0
+        log "hostapd attempt $attempt failed (radio busy) — retrying"
+        [ -f "$HOSTAPD_PID" ] && { kill "$(cat "$HOSTAPD_PID")" 2>/dev/null; rm -f "$HOSTAPD_PID"; }
+        ip link set "$AP_IFACE" down 2>/dev/null
+        sleep 2
+    done
+    return 1
+}
+
+ap_mode_ok() { iw dev "$AP_IFACE" info 2>/dev/null | grep -q "type AP"; }
+
+is_running() { [ -f "$HOSTAPD_PID" ] && kill -0 "$(cat "$HOSTAPD_PID")" 2>/dev/null; }
+
+create_ap_iface() {
+    local phy=$1
+    if ! iw dev "$AP_IFACE" info >/dev/null 2>&1; then
+        iw phy "$phy" interface add "$AP_IFACE" type __ap 2>/dev/null || \
+            die "could not create $AP_IFACE on $phy — does this card support AP mode? try: linux-hotspot doctor"
+        sleep 1   # the driver needs a beat before it will accept a mode change
+    fi
+    # Several drivers (iwlwifi especially) hand back a "managed" interface even
+    # when asked for AP, and refuse the change while the link is up.
+    if ! ap_mode_ok; then
+        ip link set "$AP_IFACE" down 2>/dev/null
+        local i
+        for i in 1 2 3 4 5; do
+            iw dev "$AP_IFACE" set type __ap 2>/dev/null && ap_mode_ok && break
+            sleep 0.5
+        done
+    fi
+    ap_mode_ok || die "$AP_IFACE would not switch into AP mode"
+
+    if [ -n "$AP_MAC" ]; then
+        ip link set "$AP_IFACE" down 2>/dev/null
+        ip link set "$AP_IFACE" address "$AP_MAC" 2>/dev/null || \
+            warn "the driver refused AP_MAC=$AP_MAC — continuing with the card's own address"
+    fi
+}
+
+wait_for_sta() {
+    local sta=$1 i
+    for i in $(seq 1 25); do
+        [ -n "$(sta_channel "$sta")" ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+require_tools() {
+    local missing=""
+    for t in iw hostapd dnsmasq ip; do
+        command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+    done
+    [ -z "$missing" ] || die "missing required tools:$missing (re-run the installer, or install them with your package manager)"
+}
+
+# --------------------------------------------------------------------- up ----
+cmd_up() {
+    need_root up
+    load_conf
+    require_tools
+
+    # Starting something that is already up must be harmless: systemd, the
+    # desktop toggle and a hand-typed `linux-hotspot up` can all race here.
+    if is_running; then
+        log "already running — nothing to do"
+        return 0
+    fi
+    # Leftovers from a crash, or from a run outside systemd, would make hostapd
+    # fail with "interface already in use". Clear them out first.
+    if [ -e "$HOSTAPD_PID" ] || [ -e "$DNSMASQ_PID" ] || iw dev "$AP_IFACE" info >/dev/null 2>&1; then
+        cmd_down >/dev/null 2>&1
+    fi
+
+    [ -n "$PASSPHRASE" ] || die "no password set — run: sudo linux-hotspot config --password 'your-password'"
+    case "$SECURITY" in
+        wpa2|wpa3|mixed) ;;
+        *) die "SECURITY must be wpa2, wpa3 or mixed (got '$SECURITY')" ;;
+    esac
+    [ ${#PASSPHRASE} -ge 8 ] && [ ${#PASSPHRASE} -le 63 ] || die "the password must be 8-63 characters"
+    [ ${#SSID} -ge 1 ] && [ ${#SSID} -le 32 ] || die "the network name must be 1-32 characters"
+
+    local sta phy uplink chan hw freq mode
+    sta=$(detect_sta) || die "no Wi-Fi interface found"
+    [ -n "$sta" ] || die "no Wi-Fi interface found — is the card present and the driver loaded?"
+    phy=$(sta_phy "$sta")
+    [ -n "$phy" ] || die "cannot work out which radio $sta belongs to"
+    uplink=$(detect_uplink)
+
+    if [ "$uplink" = "$sta" ] || { [ -z "$uplink" ] && [ -n "$(sta_channel "$sta")" ]; }; then
+        # Sharing the Wi-Fi we are connected to: one radio cannot beacon on one
+        # channel while associated on another, so we must follow the client link.
+        mode="wi-fi → wi-fi"
+        wait_for_sta "$sta" || die "$sta is not connected to any Wi-Fi network — join one first, then start the hotspot"
+        chan=$(sta_channel "$sta")
+        freq=$(sta_freq "$sta")
+        if [ -n "$freq" ] && [ "$freq" -lt 3000 ]; then hw=g; else hw=a; fi
+        if [ -n "$CHANNEL" ] && [ "$CHANNEL" != "$chan" ]; then
+            warn "ignoring CHANNEL=$CHANNEL — the AP has to stay on channel $chan with the client link"
+        fi
+    else
+        # A separate uplink (ethernet, USB tether, second card): free choice.
+        mode="${uplink:-none} → wi-fi"
+        chan=${CHANNEL:-6}
+        case "$chan" in
+            ''|*[!0-9]*) die "CHANNEL must be a number (got '$chan')" ;;
+        esac
+        if [ "$chan" -le 14 ]; then hw=g; else hw=a; fi
+        [ -n "$uplink" ] || warn "no default route — the hotspot will work but has no internet to share"
+    fi
+
+    create_ap_iface "$phy"
+    ip addr replace "$IPV4_NET.1/24" dev "$AP_IFACE"
+    ip link set "$AP_IFACE" up >/dev/null 2>&1   # hostapd does this too; EBUSY here is harmless
+
+    write_hostapd_conf "$chan" "$hw"
+    if ! start_hostapd; then
+        cmd_down >/dev/null 2>&1
+        die "hostapd would not start on channel $chan ($hw) — debug with: hostapd -d $RUN_CONF"
+    fi
+
+    mkdir -p "$(dirname "$LEASES")"
+    local dns_args="" d
+    for d in ${DNS_SERVERS//,/ }; do dns_args="$dns_args --server=$d"; done
+    # shellcheck disable=SC2086
+    if ! dnsmasq --pid-file="$DNSMASQ_PID" \
+            --interface="$AP_IFACE" --bind-interfaces --except-interface=lo \
+            --dhcp-range="$IPV4_NET.$DHCP_FIRST,$IPV4_NET.$DHCP_LAST,255.255.255.0,12h" \
+            --dhcp-option=3,"$IPV4_NET.1" --dhcp-option=6,"$IPV4_NET.1" \
+            --dhcp-leasefile="$LEASES" --no-hosts --no-resolv $dns_args; then
+        cmd_down >/dev/null 2>&1
+        die "dnsmasq failed to start — is another DHCP or DNS server already bound to $AP_IFACE?"
+    fi
+
+    firewall_up "${uplink:-$sta}"
+    local band; [ "$hw" = "g" ] && band="2.4 GHz" || band="5 GHz"
+    log "up: \"$SSID\" on channel $chan ($band), sharing $mode"
+}
+
+# ------------------------------------------------------------------- down ----
+cmd_down() {
+    need_root down
+    load_conf
+
+    local sta
+    sta=$(detect_uplink)
+    [ -n "$sta" ] || sta=$(detect_sta)
+
+    for pidfile in "$DNSMASQ_PID" "$HOSTAPD_PID"; do
+        if [ -f "$pidfile" ]; then
+            kill "$(cat "$pidfile")" 2>/dev/null
+            rm -f "$pidfile"
+        fi
+    done
+    sleep 1
+    firewall_down "${sta:-}"
+    iw dev "$AP_IFACE" del 2>/dev/null
+    rm -f "$RUN_CONF"
+    log "down"
+    return 0
+}
+
+# ----------------------------------------------------------------- status ----
+cmd_status() {
+    load_conf
+    if [ -f "$HOSTAPD_PID" ] && kill -0 "$(cat "$HOSTAPD_PID")" 2>/dev/null; then
+        local chan clients
+        chan=$(iw dev "$AP_IFACE" info 2>/dev/null | awk '$1=="channel"{gsub(/[(),]/,"",$3); print $2 " (" $3 " MHz)"}')
+        clients=$(iw dev "$AP_IFACE" station dump 2>/dev/null | grep -c '^Station')
+        echo "${C_GREEN}● running${C_RESET}"
+        echo "  network   $SSID"
+        echo "  security  $SECURITY"
+        echo "  channel   ${chan:-unknown}"
+        echo "  address   $IPV4_NET.1/24"
+        echo "  clients   ${clients:-0}"
+        if [ -s "$LEASES" ]; then
+            echo "  leases"
+            awk '{printf "            %-16s %s\n", $3, ($4=="*" ? "(no name)" : $4)}' "$LEASES"
+        fi
+        return 0
+    fi
+    echo "${C_DIM}○ stopped${C_RESET}"
+    echo "  network   $SSID"
+    return 1
+}
+
+# ----------------------------------------------------------------- doctor ----
+cmd_doctor() {
+    load_conf
+    echo "${C_BOLD}linux-hotspot $VERSION — system check${C_RESET}"
+    echo
+
+    echo "${C_BOLD}system${C_RESET}"
+    echo "  $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+    echo "  kernel $(uname -r)"
+    echo
+
+    echo "${C_BOLD}tools${C_RESET}"
+    local t
+    for t in iw hostapd dnsmasq ip; do
+        if command -v "$t" >/dev/null 2>&1; then ok "$t"; else bad "$t is missing"; fi
+    done
+    case "$(fw_backend)" in
+        iptables) ok "iptables (NAT available)" ;;
+        nft)      ok "nftables (NAT available)" ;;
+        none)     bad "neither iptables nor nft — clients would get no internet" ;;
+    esac
+    echo
+
+    echo "${C_BOLD}radio${C_RESET}"
+    local ifaces sta phy
+    ifaces=$(wifi_ifaces | tr '\n' ' ')
+    if [ -z "$ifaces" ]; then
+        bad "no Wi-Fi interfaces found"
+        return 1
+    fi
+    echo "  interfaces: $ifaces"
+    sta=$(detect_sta)
+    if [ -z "$sta" ]; then bad "could not pick a client interface"; return 1; fi
+    ok "client interface: $sta"
+    phy=$(sta_phy "$sta")
+    ok "radio: $phy"
+
+    if phy_supports_ap "$phy"; then
+        ok "the card supports AP mode"
+    else
+        bad "this card does not advertise AP mode — a hotspot is not possible with this driver"
+    fi
+
+    local combo
+    combo=$(phy_ap_combination "$phy")
+    if [ -n "$combo" ]; then
+        ok "the driver runs an AP alongside the client link"
+        if echo "$combo" | grep -q '#channels <= 1'; then
+            echo "    ${C_DIM}one channel only — the hotspot must sit on the client's channel${C_RESET}"
+        fi
+    else
+        meh "could not confirm AP + client at the same time (often still works — just try it)"
+    fi
+
+    local chan
+    chan=$(sta_channel "$sta")
+    if [ -n "$chan" ]; then
+        ok "connected on channel $chan — the hotspot will use the same channel"
+    else
+        meh "$sta is not connected; an uplink other than Wi-Fi is needed to share anything"
+    fi
+    echo
+
+    echo "${C_BOLD}routing${C_RESET}"
+    local uplink
+    uplink=$(detect_uplink)
+    if [ -n "$uplink" ]; then
+        ok "internet arrives over $uplink"
+        [ "$uplink" = "$sta" ] && echo "    → Wi-Fi to Wi-Fi: the AP is pinned to the client's channel"
+    else
+        meh "no default route — nothing to share right now"
+    fi
+    echo
+
+    echo "${C_BOLD}integration${C_RESET}"
+    if command -v nmcli >/dev/null 2>&1; then
+        if [ -f /etc/NetworkManager/conf.d/99-linux-hotspot.conf ]; then
+            ok "NetworkManager is told to leave $AP_IFACE alone"
+        else
+            meh "NetworkManager may try to manage $AP_IFACE (the installer normally prevents this)"
+        fi
+    fi
+    if [ -r "$CONF" ]; then ok "config: $CONF"; else meh "no config yet: $CONF"; fi
+    if systemctl list-unit-files linux-hotspot.service >/dev/null 2>&1; then
+        ok "service installed ($(systemctl is-enabled linux-hotspot.service 2>/dev/null))"
+    else
+        meh "systemd service not installed"
+    fi
+    echo
+    cmd_status
+}
+
+# ----------------------------------------------------------------- config ----
+cmd_config() {
+    need_root config
+    load_conf
+    local changed=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ssid)     SSID="${2:?--ssid needs a value}"; changed=1; shift 2 ;;
+            --password) PASSPHRASE="${2:?--password needs a value}"; changed=1; shift 2 ;;
+            --security) SECURITY="${2:?--security needs a value}"; changed=1; shift 2 ;;
+            --channel)  CHANNEL="${2:?--channel needs a value}"; changed=1; shift 2 ;;
+            --country)  COUNTRY="${2:?--country needs a value}"; changed=1; shift 2 ;;
+            --hidden)   HIDDEN=1; changed=1; shift ;;
+            --show)     shift ;;
+            *) die "unknown option for config: $1" ;;
+        esac
+    done
+
+    if [ "$changed" = 0 ]; then
+        echo "SSID       $SSID"
+        echo "PASSPHRASE $PASSPHRASE"
+        echo "SECURITY   $SECURITY"
+        echo "CHANNEL    ${CHANNEL:-auto}"
+        echo "COUNTRY    ${COUNTRY:-auto}"
+        echo "config file: $CONF"
+        return 0
+    fi
+
+    [ ${#PASSPHRASE} -ge 8 ] && [ ${#PASSPHRASE} -le 63 ] || die "the password must be 8-63 characters"
+    [ ${#SSID} -ge 1 ] && [ ${#SSID} -le 32 ] || die "the network name must be 1-32 characters"
+    write_conf
+    log "saved to $CONF"
+
+    if systemctl is-active --quiet linux-hotspot.service 2>/dev/null; then
+        log "restarting the hotspot so the change takes effect"
+        systemctl restart linux-hotspot.service
+    fi
+}
+
+# ------------------------------------------------------------------- help ----
+cmd_help() {
+    cat <<EOF
+${C_BOLD}linux-hotspot $VERSION${C_RESET} — share your internet over Wi-Fi
+
+${C_BOLD}usage${C_RESET}
+  linux-hotspot <command>
+
+${C_BOLD}commands${C_RESET}
+  up                     start the hotspot
+  down                   stop it and clean up
+  restart                stop, then start
+  status                 is it running, and who is connected
+  doctor                 check whether this machine can do it, and why not
+  config [options]       show or change the settings
+  help                   this text
+  version                print the version
+
+${C_BOLD}config options${C_RESET}
+  --ssid NAME            the network name devices will see
+  --password SECRET      8-63 characters
+  --security MODE        wpa2 (default) | wpa3 | mixed
+  --channel N            only used when the uplink is not Wi-Fi
+  --country XX           regulatory domain, e.g. GB, TZ, US
+  --hidden               do not broadcast the name
+
+${C_BOLD}day to day${C_RESET}
+  sudo systemctl start linux-hotspot     # or use the GNOME quick-settings toggle
+  sudo systemctl enable linux-hotspot    # bring it back automatically after a reboot
+
+${C_BOLD}notes${C_RESET}
+  When the internet arrives over the same Wi-Fi card, the hotspot is forced onto
+  the channel that card is already using — one radio cannot be in two places at
+  once. Everything else is detected for you.
+
+  Config file: $CONF
+EOF
+}
+
+# ------------------------------------------------------------------- main ----
+case "${1:-help}" in
+    up)       shift; cmd_up "$@" ;;
+    down)     shift; cmd_down "$@" ;;
+    restart)  shift; cmd_down >/dev/null 2>&1; cmd_up "$@" ;;
+    status)   shift; cmd_status "$@" ;;
+    doctor)   shift; cmd_doctor "$@" ;;
+    config)   shift; cmd_config "$@" ;;
+    version|--version|-v) echo "linux-hotspot $VERSION" ;;
+    help|--help|-h) cmd_help ;;
+    *) die "unknown command '$1' — try: linux-hotspot help" ;;
+esac

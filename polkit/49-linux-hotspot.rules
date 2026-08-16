@@ -1,0 +1,17 @@
+// Let a logged-in administrator start and stop the hotspot without being asked
+// for a password every time — otherwise the desktop toggle would throw an
+// authentication dialog at you on every click.
+//
+// Only this one unit is covered, and only for a user who is physically logged
+// in (subject.active) and already able to use sudo.
+//
+// Installed to /etc/polkit-1/rules.d/49-linux-hotspot.rules
+
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "linux-hotspot.service" &&
+        subject.active &&
+        (subject.isInGroup("sudo") || subject.isInGroup("wheel"))) {
+        return polkit.Result.YES;
+    }
+});

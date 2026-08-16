@@ -1,0 +1,14 @@
+[Unit]
+Description=Bring the Wi-Fi hotspot back after suspend
+Documentation=https://github.com/jsticks779/Hotspot-on-linux
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+# Waking up tears the radio down, and the client link may even come back on a
+# different channel — which the AP has to follow. Restart it, but only if it
+# was running when the machine went to sleep.
+ExecStart=/bin/sh -c 'systemctl is-active --quiet linux-hotspot.service && systemctl restart linux-hotspot.service || true'
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
