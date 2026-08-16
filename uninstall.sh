@@ -20,20 +20,25 @@ CONF_DIR=/etc/linux-hotspot
 echo ":: stopping the hotspot"
 systemctl disable --now linux-hotspot.service >/dev/null 2>&1 || true
 systemctl disable --now linux-hotspot-resume.service >/dev/null 2>&1 || true
-[ -x /usr/local/bin/linux-hotspot ] && /usr/local/bin/linux-hotspot down >/dev/null 2>&1 || true
+if [ -x /usr/local/bin/linux-hotspot ]; then
+    /usr/local/bin/linux-hotspot down >/dev/null 2>&1 || true
+fi
 
 echo ":: removing files"
 rm -f /etc/systemd/system/linux-hotspot.service /etc/systemd/system/linux-hotspot-resume.service
 rm -f /etc/polkit-1/rules.d/49-linux-hotspot.rules
 rm -f /etc/NetworkManager/conf.d/99-linux-hotspot.conf
 rm -f /usr/local/bin/linux-hotspot /usr/local/bin/hotspot
-rm -f /run/linux-hotspot-* /var/lib/misc/linux-hotspot.leases
-command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
+rm -f /run/linux-hotspot* /var/lib/misc/linux-hotspot.leases
+if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
 
 # The desktop toggle lives in the user's home, not in /usr.
 for home in /home/*; do
     ext="$home/.local/share/gnome-shell/extensions/$EXT_UUID"
-    [ -d "$ext" ] && rm -rf "$ext" && echo ":: removed the GNOME toggle from $home"
+    if [ -d "$ext" ]; then
+        rm -rf "$ext"
+        echo ":: removed the GNOME toggle from $home"
+    fi
 done
 
 if systemctl is-active NetworkManager >/dev/null 2>&1; then

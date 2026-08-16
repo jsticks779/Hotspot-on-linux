@@ -18,6 +18,7 @@ RUN_CONF=/run/linux-hotspot-hostapd.conf
 HOSTAPD_PID=/run/linux-hotspot-hostapd.pid
 DNSMASQ_PID=/run/linux-hotspot-dnsmasq.pid
 FORWARD_SAVE=/run/linux-hotspot.ip_forward
+UPLINK_SAVE=/run/linux-hotspot.uplink
 LEASES=/var/lib/misc/linux-hotspot.leases
 NFT_TABLE=linux_hotspot
 
@@ -54,6 +55,15 @@ bad()  { echo "${C_RED}✗${C_RESET} $*"; }
 meh()  { echo "${C_YELLOW}!${C_RESET} $*"; }
 
 need_root() { [ "$(id -u)" = 0 ] || die "this command needs root — try: sudo linux-hotspot $*"; }
+
+validate_credentials() {
+    if [ ${#SSID} -lt 1 ] || [ ${#SSID} -gt 32 ]; then
+        die "the network name must be 1-32 characters"
+    fi
+    if [ ${#PASSPHRASE} -lt 8 ] || [ ${#PASSPHRASE} -gt 63 ]; then
+        die "the password must be 8-63 characters"
+    fi
+}
 
 # ------------------------------------------------------------ configuration --
 # Parsed rather than sourced: the file is writable by the desktop user so the
@@ -181,6 +191,12 @@ firewall_up() {
     local sta=$1 net="$IPV4_NET.0/24" backend
     backend=$(fw_backend)
 
+    # Remember which interface we masqueraded out of. By the time we tear down,
+    # the default route may point somewhere else entirely (someone plugged in
+    # ethernet), and deleting rules for the wrong interface would leave the real
+    # ones behind.
+    echo "$sta" > "$UPLINK_SAVE"
+
     if [ ! -f "$FORWARD_SAVE" ]; then
         sysctl -n net.ipv4.ip_forward > "$FORWARD_SAVE" 2>/dev/null || echo 0 > "$FORWARD_SAVE"
     fi
@@ -230,6 +246,7 @@ firewall_down() {
         sysctl -qw "net.ipv4.ip_forward=$(cat "$FORWARD_SAVE")" 2>/dev/null
         rm -f "$FORWARD_SAVE"
     fi
+    rm -f "$UPLINK_SAVE"
     return 0
 }
 
@@ -376,8 +393,7 @@ cmd_up() {
         wpa2|wpa3|mixed) ;;
         *) die "SECURITY must be wpa2, wpa3 or mixed (got '$SECURITY')" ;;
     esac
-    [ ${#PASSPHRASE} -ge 8 ] && [ ${#PASSPHRASE} -le 63 ] || die "the password must be 8-63 characters"
-    [ ${#SSID} -ge 1 ] && [ ${#SSID} -le 32 ] || die "the network name must be 1-32 characters"
+    validate_credentials
 
     local sta phy uplink chan hw freq mode
     sta=$(detect_sta) || die "no Wi-Fi interface found"
@@ -386,26 +402,41 @@ cmd_up() {
     [ -n "$phy" ] || die "cannot work out which radio $sta belongs to"
     uplink=$(detect_uplink)
 
-    if [ "$uplink" = "$sta" ] || { [ -z "$uplink" ] && [ -n "$(sta_channel "$sta")" ]; }; then
-        # Sharing the Wi-Fi we are connected to: one radio cannot beacon on one
-        # channel while associated on another, so we must follow the client link.
-        mode="wi-fi → wi-fi"
-        wait_for_sta "$sta" || die "$sta is not connected to any Wi-Fi network — join one first, then start the hotspot"
-        chan=$(sta_channel "$sta")
+    # If the only possible source of internet is the Wi-Fi link itself, it is
+    # worth waiting for it to associate — at boot we can easily be here before
+    # NetworkManager has finished connecting.
+    if [ -z "$uplink" ] || [ "$uplink" = "$sta" ]; then
+        wait_for_sta "$sta" || \
+            die "$sta is not connected to any Wi-Fi network — join one first, then start the hotspot"
+    fi
+
+    # The channel is dictated by the *radio*, not by where the internet comes
+    # from. If the card is associated with a network — even when the internet
+    # arrives over ethernet — the AP has to sit on that same channel, because
+    # one radio cannot be tuned to two channels at once.
+    chan=$(sta_channel "$sta")
+    if [ -n "$chan" ]; then
         freq=$(sta_freq "$sta")
         if [ -n "$freq" ] && [ "$freq" -lt 3000 ]; then hw=g; else hw=a; fi
         if [ -n "$CHANNEL" ] && [ "$CHANNEL" != "$chan" ]; then
-            warn "ignoring CHANNEL=$CHANNEL — the AP has to stay on channel $chan with the client link"
+            warn "ignoring CHANNEL=$CHANNEL — $sta is associated on channel $chan and the radio must stay there"
         fi
     else
-        # A separate uplink (ethernet, USB tether, second card): free choice.
-        mode="${uplink:-none} → wi-fi"
+        # The card is idle, so the channel is ours to choose.
         chan=${CHANNEL:-6}
         case "$chan" in
             ''|*[!0-9]*) die "CHANNEL must be a number (got '$chan')" ;;
         esac
         if [ "$chan" -le 14 ]; then hw=g; else hw=a; fi
-        [ -n "$uplink" ] || warn "no default route — the hotspot will work but has no internet to share"
+    fi
+
+    if [ -z "$uplink" ]; then
+        warn "no default route — the hotspot will work but has no internet to share"
+        mode="nothing → wi-fi"
+    elif [ "$uplink" = "$sta" ]; then
+        mode="wi-fi → wi-fi"
+    else
+        mode="$uplink → wi-fi"
     fi
 
     create_ap_iface "$phy"
@@ -441,9 +472,14 @@ cmd_down() {
     need_root down
     load_conf
 
-    local sta
-    sta=$(detect_uplink)
-    [ -n "$sta" ] || sta=$(detect_sta)
+    # Prefer the interface we actually masqueraded out of, recorded at start.
+    local sta pidfile
+    if [ -r "$UPLINK_SAVE" ]; then
+        sta=$(cat "$UPLINK_SAVE")
+    else
+        sta=$(detect_uplink)
+        [ -n "$sta" ] || sta=$(detect_sta)
+    fi
 
     for pidfile in "$DNSMASQ_PID" "$HOSTAPD_PID"; do
         if [ -f "$pidfile" ]; then
@@ -490,6 +526,7 @@ cmd_doctor() {
     echo
 
     echo "${C_BOLD}system${C_RESET}"
+    # shellcheck source=/dev/null
     echo "  $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
     echo "  kernel $(uname -r)"
     echo
@@ -603,8 +640,7 @@ cmd_config() {
         return 0
     fi
 
-    [ ${#PASSPHRASE} -ge 8 ] && [ ${#PASSPHRASE} -le 63 ] || die "the password must be 8-63 characters"
-    [ ${#SSID} -ge 1 ] && [ ${#SSID} -le 32 ] || die "the network name must be 1-32 characters"
+    validate_credentials
     write_conf
     log "saved to $CONF"
 

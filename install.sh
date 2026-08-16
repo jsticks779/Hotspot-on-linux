@@ -86,6 +86,7 @@ DESKTOP_HOME=""
 
 echo
 echo "${C_BOLD}linux-hotspot${C_RESET} — share your internet over Wi-Fi"
+# shellcheck source=/dev/null
 echo "${C_DIM}$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown system}") · kernel $(uname -r)${C_RESET}"
 echo
 
@@ -122,13 +123,20 @@ ask_credentials() {
 GENERATED_PASSWORD=0
 ask_credentials
 
-[ ${#SSID_ARG} -ge 1 ] && [ ${#SSID_ARG} -le 32 ] || die "the network name must be 1-32 characters"
-[ ${#PASS_ARG} -ge 8 ] && [ ${#PASS_ARG} -le 63 ] || die "the password must be 8-63 characters"
+if [ ${#SSID_ARG} -lt 1 ] || [ ${#SSID_ARG} -gt 32 ]; then
+    die "the network name must be 1-32 characters"
+fi
+if [ ${#PASS_ARG} -lt 8 ] || [ ${#PASS_ARG} -gt 63 ]; then
+    die "the password must be 8-63 characters"
+fi
 
 # ------------------------------------------------------------- dependencies -
 install_deps() {
     local pkgs="hostapd dnsmasq iw"
     say "installing $pkgs"
+    # $pkgs is deliberately unquoted below: it must split into one argument
+    # per package.
+    # shellcheck disable=SC2086
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq || true
         DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs iptables >/dev/null
