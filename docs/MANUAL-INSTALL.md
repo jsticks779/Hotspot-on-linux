@@ -35,8 +35,9 @@ No `* AP` at all? Stop here — see [COMPATIBILITY.md](COMPATIBILITY.md).
 ## Step 1 — install the dependencies
 
 ```bash
-# Debian / Ubuntu / Mint / Pop!_OS
-sudo apt update && sudo apt install -y hostapd dnsmasq iw iptables
+# Debian / Ubuntu / Kali / Mint / Pop!_OS
+#   dnsmasq-base, NOT dnsmasq — see the warning below
+sudo apt update && sudo apt install -y hostapd dnsmasq-base iw iptables
 
 # Fedora / RHEL
 sudo dnf install -y hostapd dnsmasq iw
@@ -48,13 +49,27 @@ sudo pacman -S --needed hostapd dnsmasq iw
 sudo zypper install hostapd dnsmasq iw
 ```
 
+> **Debian-family users: install `dnsmasq-base`, not `dnsmasq`.** The base
+> package ships the `/usr/sbin/dnsmasq` binary, which is all this project needs.
+> The full `dnsmasq` package adds a *system-wide DNS daemon* that its postinst
+> starts immediately — it grabs port 53 and can take name resolution down on the
+> spot, mid-install. If you have already installed it and DNS is broken:
+>
+> ```bash
+> sudo systemctl disable --now dnsmasq
+> sudo systemctl restart NetworkManager
+> getent hosts github.com          # should print an address again
+> ```
+
 ---
 
 ## Step 2 — switch off the packaged services
 
-Installing those packages usually enables a system-wide `hostapd` and a
-system-wide `dnsmasq`. This project runs its own private instances; leaving the
-packaged ones on means two DHCP servers and a fight over port 53.
+Installing `hostapd` usually enables a system-wide service, and if the full
+`dnsmasq` package is already on the machine it has one too. This project runs
+its own private instances; leaving the packaged ones on means two DHCP servers
+and a fight over port 53. (With `dnsmasq-base` there is no dnsmasq service to
+switch off — that is the point of using it.)
 
 ```bash
 sudo systemctl disable --now hostapd

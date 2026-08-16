@@ -95,6 +95,36 @@ sudo systemctl disable linux-hotspot
 
 ---
 
+## Installing broke DNS on the machine itself
+
+Symptom: partway through installation, or right after it, the machine can no
+longer resolve names — `curl` reports `Could not resolve host`, apt fails, the
+browser stops working.
+
+Cause: the full `dnsmasq` package (as opposed to `dnsmasq-base`) is a
+*system-wide DNS daemon*. On Debian-family systems its postinst starts it the
+moment it is installed, and it takes port 53. Depending on how the machine
+resolves names, that can knock DNS out instantly.
+
+Fix:
+
+```bash
+sudo systemctl disable --now dnsmasq
+sudo systemctl restart NetworkManager      # or: systemctl restart systemd-resolved
+getent hosts github.com                    # should print an address again
+```
+
+Current versions of the installer avoid this entirely: on Debian-family systems
+they install `dnsmasq-base` (just the binary this project runs itself), guard the
+install with `policy-rc.d` so no packaged daemon starts, and check that name
+resolution still works afterwards. If you are following the manual instructions,
+install `dnsmasq-base`, never `dnsmasq`.
+
+You can leave the full `dnsmasq` package installed once its service is disabled —
+the hotspot uses the binary directly and never touches that service.
+
+---
+
 ## Devices connect, but there is no internet
 
 This is a routing problem, not a Wi-Fi problem. Work down the list:

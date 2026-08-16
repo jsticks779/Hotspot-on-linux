@@ -36,6 +36,12 @@ ok()   { echo "${C_GREEN}✓${C_RESET} $*"; }
 warn() { echo "${C_YELLOW}!${C_RESET} $*" >&2; }
 die()  { echo "${C_RED}error:${C_RESET} $*" >&2; exit 1; }
 
+# Installing DNS-adjacent packages has been known to take name resolution down
+# with it, so we check rather than assume.
+dns_ok() {
+    getent hosts github.com >/dev/null 2>&1 || getent hosts example.com >/dev/null 2>&1
+}
+
 # ------------------------------------------------------------------- options -
 SSID_ARG="${SSID:-}"
 PASS_ARG="${PASSWORD:-}"
@@ -130,16 +136,62 @@ if [ ${#PASS_ARG} -lt 8 ] || [ ${#PASS_ARG} -gt 63 ]; then
     die "the password must be 8-63 characters"
 fi
 
+# ------------------------------------------------------------------- files --
+SRC=""
+SELF="${BASH_SOURCE[0]:-}"
+if [ -n "$SELF" ] && [ -f "$SELF" ]; then
+    CANDIDATE=$(cd "$(dirname "$SELF")" && pwd)
+    [ -f "$CANDIDATE/bin/linux-hotspot" ] && SRC="$CANDIDATE"
+fi
+
+if [ -z "$SRC" ]; then
+    command -v curl >/dev/null 2>&1 || die "curl is needed to download the project files"
+    SRC=$(mktemp -d)
+    trap 'rm -rf "$SRC"' EXIT
+    say "downloading from github.com/$REPO ($REF)"
+    mkdir -p "$SRC/bin" "$SRC/systemd" "$SRC/polkit" "$SRC/gnome-extension/$EXT_UUID"
+    for f in bin/linux-hotspot systemd/linux-hotspot.service systemd/linux-hotspot-resume.service \
+             polkit/49-linux-hotspot.rules \
+             "gnome-extension/$EXT_UUID/metadata.json" "gnome-extension/$EXT_UUID/extension.js"; do
+        if ! curl -fsSL "$RAW/$f" -o "$SRC/$f"; then
+            if ! dns_ok; then
+                die "cannot reach github.com — name resolution is not working on this machine"
+            fi
+            die "could not download $f — is the repository public and the branch '$REF' correct?"
+        fi
+    done
+    ok "downloaded"
+fi
+
 # ------------------------------------------------------------- dependencies -
 install_deps() {
     local pkgs="hostapd dnsmasq iw"
-    say "installing $pkgs"
+    say "installing dependencies (hostapd, dnsmasq, iw)"
     # $pkgs is deliberately unquoted below: it must split into one argument
     # per package.
     # shellcheck disable=SC2086
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq || true
-        DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs iptables >/dev/null
+        # Deliberately dnsmasq-base, not dnsmasq: the base package ships the
+        # /usr/sbin/dnsmasq binary this project runs itself, while the full
+        # package adds a system-wide DNS daemon whose postinst starts it
+        # immediately, seizes port 53 and can knock out name resolution on the
+        # spot. policy-rc.d is a second belt: it tells maintainer scripts not
+        # to start anything they install.
+        local policy=/usr/sbin/policy-rc.d policy_ours=0 rc=0
+        if [ ! -e "$policy" ]; then
+            printf '#!/bin/sh\nexit 101\n' > "$policy"
+            chmod +x "$policy"
+            policy_ours=1
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            hostapd dnsmasq-base iw iptables >/dev/null || rc=$?
+        if [ "$policy_ours" = 1 ]; then
+            rm -f "$policy"
+        fi
+        if [ "$rc" != 0 ]; then
+            return "$rc"
+        fi
     elif command -v dnf >/dev/null 2>&1; then
         dnf install -y $pkgs >/dev/null
     elif command -v yum >/dev/null 2>&1; then
@@ -172,28 +224,21 @@ if command -v systemctl >/dev/null 2>&1; then
             say "switched off the system-wide $unit service (this project runs its own)"
         fi
     done
-fi
 
-# ------------------------------------------------------------------- files --
-SRC=""
-SELF="${BASH_SOURCE[0]:-}"
-if [ -n "$SELF" ] && [ -f "$SELF" ]; then
-    CANDIDATE=$(cd "$(dirname "$SELF")" && pwd)
-    [ -f "$CANDIDATE/bin/linux-hotspot" ] && SRC="$CANDIDATE"
-fi
-
-if [ -z "$SRC" ]; then
-    command -v curl >/dev/null 2>&1 || die "curl is needed to download the project files"
-    SRC=$(mktemp -d)
-    trap 'rm -rf "$SRC"' EXIT
-    say "downloading from github.com/$REPO ($REF)"
-    mkdir -p "$SRC/bin" "$SRC/systemd" "$SRC/polkit" "$SRC/gnome-extension/$EXT_UUID"
-    for f in bin/linux-hotspot systemd/linux-hotspot.service systemd/linux-hotspot-resume.service \
-             polkit/49-linux-hotspot.rules \
-             "gnome-extension/$EXT_UUID/metadata.json" "gnome-extension/$EXT_UUID/extension.js"; do
-        curl -fsSL "$RAW/$f" -o "$SRC/$f" || die "could not download $f — is the repository public and the branch '$REF' correct?"
-    done
-    ok "downloaded"
+    # If a packaged daemon grabbed port 53 on the way in, the machine has no
+    # working DNS right now. Say so, and try to give it back.
+    if ! dns_ok; then
+        warn "name resolution stopped working while installing packages — repairing"
+        systemctl disable --now dnsmasq >/dev/null 2>&1 || true
+        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+        systemctl restart NetworkManager >/dev/null 2>&1 || true
+        sleep 2
+        if dns_ok; then
+            ok "name resolution restored"
+        else
+            warn "DNS is still down. Check: systemctl status dnsmasq; cat /etc/resolv.conf"
+        fi
+    fi
 fi
 
 install -m 0755 "$SRC/bin/linux-hotspot" "$PREFIX/linux-hotspot"
