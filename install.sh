@@ -348,5 +348,13 @@ echo
 echo "  sudo linux-hotspot status     see who is connected"
 echo "  sudo linux-hotspot doctor     check this machine"
 echo "  sudo systemctl stop linux-hotspot"
-[ -n "$EXTENSION_NOTE" ] && echo && echo "  ${C_YELLOW}$EXTENSION_NOTE${C_RESET}"
+if [ -n "$EXTENSION_NOTE" ]; then
+    # This is the single most common source of confusion: the tile cannot show
+    # up in a session that started before the extension was installed.
+    echo
+    echo "  ${C_YELLOW}▌${C_RESET} ${C_BOLD}One more step for the desktop toggle${C_RESET}"
+    echo "  ${C_YELLOW}▌${C_RESET} $EXTENSION_NOTE"
+    echo "  ${C_YELLOW}▌${C_RESET} ${C_DIM}GNOME only looks for new extensions at login, so the${C_RESET}"
+    echo "  ${C_YELLOW}▌${C_RESET} ${C_DIM}tile cannot appear in a session that is already running.${C_RESET}"
+fi
 echo

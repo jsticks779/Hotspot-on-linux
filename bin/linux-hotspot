@@ -21,6 +21,7 @@ FORWARD_SAVE=/run/linux-hotspot.ip_forward
 UPLINK_SAVE=/run/linux-hotspot.uplink
 LEASES=/var/lib/misc/linux-hotspot.leases
 NFT_TABLE=linux_hotspot
+EXT_UUID="linux-hotspot@jsticks779.github.io"
 
 # ----------------------------------------------------------------- defaults --
 # Every one of these can be overridden in /etc/linux-hotspot/hotspot.conf
@@ -519,6 +520,50 @@ cmd_status() {
     return 1
 }
 
+# Is the desktop toggle installed, and has the running GNOME session actually
+# picked it up? A shell only scans for extensions at login, so installing while
+# logged in leaves the tile missing until the next one — which looks exactly
+# like a broken extension unless something says so out loud.
+check_desktop_toggle() {
+    command -v gnome-shell >/dev/null 2>&1 || return 0
+
+    local user home dir uid state
+    user="${SUDO_USER:-$(id -un)}"
+    home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+    dir="$home/.local/share/gnome-shell/extensions/$EXT_UUID"
+
+    if [ -z "$home" ] || [ ! -d "$dir" ]; then
+        meh "the GNOME quick-settings toggle is not installed for $user"
+        return 0
+    fi
+
+    uid=$(id -u "$user" 2>/dev/null)
+    if [ -z "$uid" ] || [ ! -S "/run/user/$uid/bus" ]; then
+        ok "the GNOME toggle is installed (no active session to check against)"
+        return 0
+    fi
+
+    if [ "$(id -u)" = "$uid" ]; then
+        state=$(gnome-extensions info "$EXT_UUID" 2>/dev/null | awk -F': ' '/State:/{print $2}')
+    else
+        state=$(sudo -u "$user" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            gnome-extensions info "$EXT_UUID" 2>/dev/null | awk -F': ' '/State:/{print $2}')
+    fi
+
+    case "$state" in
+        ACTIVE)
+            ok "the GNOME toggle is loaded" ;;
+        ERROR)
+            bad "the GNOME toggle failed to load"
+            echo "    see why: journalctl --user -b 0 | grep $EXT_UUID" ;;
+        "")
+            meh "the GNOME toggle is installed, but this desktop session started before it was"
+            echo "    ${C_DIM}log out and back in — the tile cannot appear until the shell restarts${C_RESET}" ;;
+        *)
+            meh "the GNOME toggle is installed but currently $state" ;;
+    esac
+}
+
 # ----------------------------------------------------------------- doctor ----
 cmd_doctor() {
     load_conf
@@ -602,6 +647,7 @@ cmd_doctor() {
             meh "NetworkManager may try to manage $AP_IFACE (the installer normally prevents this)"
         fi
     fi
+    check_desktop_toggle
     if [ -r "$CONF" ]; then ok "config: $CONF"; else meh "no config yet: $CONF"; fi
     if systemctl list-unit-files linux-hotspot.service >/dev/null 2>&1; then
         ok "service installed ($(systemctl is-enabled linux-hotspot.service 2>/dev/null))"

@@ -182,9 +182,25 @@ sudo systemctl restart linux-hotspot
 
 ### There is no Hotspot tile in quick settings
 
-1. **Did you log out and back in?** GNOME Shell only scans for new extensions at
-   login, and on Wayland there is no way to reload it in place. This is the
-   answer nine times out of ten.
+Ask `doctor` first — it knows the difference between "not installed", "failed to
+load" and "installed, but your session is older than the install":
+
+```bash
+sudo linux-hotspot doctor        # look at the "integration" section
+```
+
+1. **Did you log out and back in *after* installing?** GNOME Shell only scans
+   for extensions at login, and on Wayland there is no way to reload it in
+   place. Installing while already logged in — which is what everybody does —
+   means the tile cannot appear until the next login. This is the answer nine
+   times out of ten, and `doctor` says so explicitly when it applies.
+
+   Note that locking and unlocking the screen is *not* enough; the `gnome-shell`
+   process itself has to restart. If you are unsure whether it did:
+
+   ```bash
+   ps -o lstart= -C gnome-shell     # when the shell actually started
+   ```
 2. Check it is enabled and healthy:
    ```bash
    gnome-extensions info linux-hotspot@jsticks779.github.io
