@@ -67,6 +67,7 @@ sudo linux-hotspot down      # stop
 sudo linux-hotspot status    # what's running, who is connected
 sudo linux-hotspot doctor    # can this machine do it? if not, why not
 sudo linux-hotspot config --password 'new-password'
+sudo linux-hotspot roam      # pause, join another Wi-Fi, come back on its channel
 ```
 
 **A service**, so it comes back after a reboot and after suspend:
@@ -133,6 +134,28 @@ card), that restriction disappears and you can pick any channel you like:
 sudo linux-hotspot config --channel 6
 ```
 
+### Joining a different Wi-Fi network while the hotspot runs
+
+The same rule has a consequence people hit immediately: **you cannot join a
+network on another channel while the hotspot is up.** The radio is pinned to the
+AP's channel, so the network shows up in the list, you enter the password, and
+the connection quietly fails.
+
+You do not have to do anything about it. A NetworkManager hook steps the hotspot
+aside the moment the Wi-Fi link drops, and brings it back on whatever channel
+you land on — so switching networks from the desktop menu just works. Verified
+live: a machine hopped from a 5 GHz network on channel 149 to a 2.4 GHz one on
+channel 1, and the hotspot followed on its own.
+
+If you are not running NetworkManager, or you would rather drive it yourself:
+
+```bash
+sudo linux-hotspot roam
+```
+
+That pauses the hotspot, waits for you to connect to whatever you like, and
+restarts it on the new channel.
+
 ---
 
 ## Configuration
@@ -179,6 +202,7 @@ Six moving parts, each doing one job:
 | `dnsmasq` | hands out addresses on `10.42.0.0/24` and forwards DNS |
 | `iptables`/`nft` | masquerades hotspot traffic out through your uplink |
 | `systemd` | starts, stops, survives reboot and suspend |
+| NM dispatcher | steps the hotspot aside while you switch networks |
 | polkit | lets you toggle it from the desktop without a password prompt |
 
 The full walkthrough — why each choice was made, and the driver quirks that
@@ -200,6 +224,7 @@ Every failure this project has actually hit — and the fix — is written up in
 - clients connect but have no internet
 - "Device or resource busy" when starting
 - the hotspot works, then dies after suspend
+- you cannot join another Wi-Fi network while it is running
 - GNOME shows a second "Wi-Fi (ap0)" device
 - the toggle asks for a password every time
 
@@ -222,6 +247,7 @@ install.sh / uninstall.sh            the one-command installer and its inverse
 systemd/linux-hotspot.service        start/stop/boot
 systemd/linux-hotspot-resume.service bring it back after suspend
 polkit/49-linux-hotspot.rules        toggle without a password prompt
+networkmanager/50-linux-hotspot      follow the client link onto new channels
 gnome-extension/                     the quick-settings tile
 docs/                                the long-form documentation
 ```

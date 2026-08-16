@@ -28,6 +28,7 @@ echo ":: removing files"
 rm -f /etc/systemd/system/linux-hotspot.service /etc/systemd/system/linux-hotspot-resume.service
 rm -f /etc/polkit-1/rules.d/49-linux-hotspot.rules
 rm -f /etc/NetworkManager/conf.d/99-linux-hotspot.conf
+rm -f /etc/NetworkManager/dispatcher.d/50-linux-hotspot
 rm -f /usr/local/bin/linux-hotspot /usr/local/bin/hotspot
 rm -f /run/linux-hotspot* /var/lib/misc/linux-hotspot.leases
 if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi

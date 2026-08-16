@@ -496,6 +496,65 @@ cmd_down() {
     return 0
 }
 
+# Prefer systemd when it owns the hotspot, so its idea of the state stays true.
+hotspot_stop() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl cat linux-hotspot.service >/dev/null 2>&1; then
+        systemctl stop linux-hotspot.service
+    else
+        cmd_down >/dev/null 2>&1
+    fi
+}
+
+hotspot_start() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl cat linux-hotspot.service >/dev/null 2>&1; then
+        systemctl start linux-hotspot.service
+    else
+        cmd_up
+    fi
+}
+
+# ------------------------------------------------------------------- roam ----
+# Joining a different network while the hotspot is running is impossible on a
+# single radio: the AP holds the channel, and the client cannot associate on a
+# different one. So step out of the way, wait for the new link, come back on
+# whatever channel it landed on.
+cmd_roam() {
+    need_root roam
+    load_conf
+
+    local timeout="${1:-120}" sta before now saw_gap=0 i
+    case "$timeout" in
+        ''|*[!0-9]*) die "roam takes a number of seconds, e.g. linux-hotspot roam 60" ;;
+    esac
+
+    sta=$(detect_sta) || die "no Wi-Fi interface found"
+    before=$(iw dev "$sta" link 2>/dev/null | awk '/^Connected to/{print $3}')
+
+    log "pausing the hotspot so the radio is free to change channel"
+    hotspot_stop
+
+    echo
+    echo "  ${C_BOLD}Join the Wi-Fi network you want now${C_RESET} — from your desktop, or with nmcli."
+    echo "  ${C_DIM}Waiting up to ${timeout}s; the hotspot then returns on the new channel.${C_RESET}"
+    echo
+
+    for i in $(seq 1 "$timeout"); do
+        now=$(iw dev "$sta" link 2>/dev/null | awk '/^Connected to/{print $3}')
+        [ -z "$now" ] && saw_gap=1
+        # a different access point, or the same one after a real disconnect
+        if [ -n "$now" ] && { [ "$now" != "$before" ] || [ "$saw_gap" = 1 ]; }; then
+            sleep 2   # let the link settle before reading the channel off it
+            log "joined $(iw dev "$sta" link 2>/dev/null | awk '/^SSID:/{print $2}') on channel $(sta_channel "$sta")"
+            hotspot_start
+            return 0
+        fi
+        sleep 1
+    done
+
+    warn "nothing new joined within ${timeout}s — putting the hotspot back as it was"
+    hotspot_start
+}
+
 # ----------------------------------------------------------------- status ----
 cmd_status() {
     load_conf
@@ -708,6 +767,7 @@ ${C_BOLD}commands${C_RESET}
   up                     start the hotspot
   down                   stop it and clean up
   restart                stop, then start
+  roam [seconds]         pause, let you join another Wi-Fi, then come back
   status                 is it running, and who is connected
   doctor                 check whether this machine can do it, and why not
   config [options]       show or change the settings
@@ -731,6 +791,11 @@ ${C_BOLD}notes${C_RESET}
   the channel that card is already using — one radio cannot be in two places at
   once. Everything else is detected for you.
 
+  That is also why you cannot join a different Wi-Fi network while the hotspot
+  is running: the radio is pinned to the AP's channel. Use \`linux-hotspot roam\`,
+  which steps aside, waits for you to connect, and brings the hotspot back on
+  the new channel.
+
   Config file: $CONF
 EOF
 }
@@ -740,6 +805,7 @@ case "${1:-help}" in
     up)       shift; cmd_up "$@" ;;
     down)     shift; cmd_down "$@" ;;
     restart)  shift; cmd_down >/dev/null 2>&1; cmd_up "$@" ;;
+    roam)     shift; cmd_roam "$@" ;;
     status)   shift; cmd_status "$@" ;;
     doctor)   shift; cmd_doctor "$@" ;;
     config)   shift; cmd_config "$@" ;;

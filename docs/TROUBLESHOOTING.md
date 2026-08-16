@@ -175,6 +175,45 @@ reduce the MTU on `ap0`.
 
 ---
 
+## I cannot join another Wi-Fi network while the hotspot is on
+
+You can see the network, the password is right, and it still will not connect.
+Switch the hotspot off, connect, switch it back on — and it works.
+
+That is the single-radio rule, not a fault. While the hotspot runs, the radio is
+pinned to the AP's channel, and the card cannot associate with a network on a
+different one. Your own hardware says so:
+
+```bash
+iw phy phy0 info | grep -A2 "valid interface combinations"
+#   ... #{ managed } <= 1, #{ AP, ... } <= 1, total <= 3, #channels <= 1
+#                                                          ^^^^^^^^^^^^^
+```
+
+Current versions handle it for you. A NetworkManager dispatcher hook at
+`/etc/NetworkManager/dispatcher.d/50-linux-hotspot` pauses the hotspot when the
+Wi-Fi link goes down and restarts it once you are connected again — on the new
+channel. Switching networks from the desktop produces exactly that down-then-up
+pair, so it happens by itself.
+
+If you are not using NetworkManager, drive it manually:
+
+```bash
+sudo linux-hotspot roam        # pauses, waits for you to connect, comes back
+```
+
+To check the hook is in place:
+
+```bash
+ls -l /etc/NetworkManager/dispatcher.d/50-linux-hotspot   # must be root-owned, executable
+```
+
+NetworkManager silently ignores dispatcher scripts that are group- or
+world-writable. Delete the file if you would rather the hotspot never paused
+itself.
+
+---
+
 ## It works, then stops
 
 ### After suspend

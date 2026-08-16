@@ -1,0 +1,53 @@
+#!/bin/sh
+#
+# NetworkManager dispatcher hook for linux-hotspot.
+#
+# One radio can only be on one channel. While the hotspot is running it owns
+# that channel, and the client link cannot associate with a network on any
+# other one — you see the network, you type the password, and it just fails.
+#
+# So: when the Wi-Fi link goes down, step the hotspot out of the way and
+# remember that we did. When a link comes back up, put the hotspot back — on
+# whatever channel we have landed on this time.
+#
+# Switching networks from the desktop produces exactly that down-then-up pair,
+# which is what makes this work without the user doing anything.
+#
+# Installed to /etc/NetworkManager/dispatcher.d/50-linux-hotspot
+# Delete the file if you would rather manage the hotspot by hand.
+
+IFACE="$1"
+ACTION="$2"
+
+FLAG=/run/linux-hotspot.autopaused
+UNIT=linux-hotspot.service
+
+# Only wireless interfaces matter. An ethernet cable coming and going must not
+# disturb an access point that is happily serving clients.
+command -v iw >/dev/null 2>&1 || exit 0
+iw dev "$IFACE" info >/dev/null 2>&1 || exit 0
+
+# Never react to the hotspot's own interface.
+AP_IFACE=$(sed -n 's/^AP_IFACE=//p' /etc/linux-hotspot/hotspot.conf 2>/dev/null)
+[ -n "$AP_IFACE" ] || AP_IFACE=ap0
+[ "$IFACE" = "$AP_IFACE" ] && exit 0
+
+case "$ACTION" in
+    pre-down|down)
+        if systemctl is-active --quiet "$UNIT" 2>/dev/null; then
+            touch "$FLAG"
+            # Deliberately synchronous: the radio has to be free before
+            # NetworkManager tries to associate somewhere else.
+            systemctl stop "$UNIT" >/dev/null 2>&1
+        fi
+        ;;
+    up)
+        if [ -e "$FLAG" ]; then
+            rm -f "$FLAG"
+            # Non-blocking, so a slow start cannot hold up the dispatcher queue.
+            systemctl --no-block start "$UNIT" >/dev/null 2>&1
+        fi
+        ;;
+esac
+
+exit 0

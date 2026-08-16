@@ -238,6 +238,42 @@ unmanaged-devices=interface-name:ap0
 > with it. If you hand-edit these, check `systemctl status NetworkManager`
 > afterwards.
 
+### Following you onto a new network
+
+The channel rule has a sharp edge: while the AP holds the radio, the client
+cannot associate with a network on any *other* channel. Joining a different
+Wi-Fi simply fails, and the only way through is to stop the hotspot first.
+
+A dispatcher script makes that automatic:
+
+```sh
+# /etc/NetworkManager/dispatcher.d/50-linux-hotspot
+case "$ACTION" in
+    pre-down|down) # free the radio, remember we did
+        systemctl is-active --quiet linux-hotspot.service && \
+            { touch /run/linux-hotspot.autopaused; systemctl stop linux-hotspot.service; } ;;
+    up)            # come back, on whatever channel we landed on
+        [ -e /run/linux-hotspot.autopaused ] && \
+            { rm -f /run/linux-hotspot.autopaused; systemctl --no-block start linux-hotspot.service; } ;;
+esac
+```
+
+Switching networks from the desktop produces exactly that down-then-up pair, so
+the whole dance happens without anybody asking for it. The flag file matters:
+without it, a hotspot you switched off deliberately would come back on by itself
+the next time any Wi-Fi connected.
+
+The `down` case is stopped **synchronously** — the radio has to be genuinely free
+before NetworkManager attempts the next association — while `up` starts with
+`--no-block` so a slow start cannot stall the dispatcher queue. Only wireless
+interfaces are considered, so an ethernet cable coming and going never disturbs
+an access point that is happily serving clients.
+
+Tested live on the 9260: the machine left a 5 GHz network on channel 149,
+joined a 2.4 GHz one on channel 1, and the hotspot came back on channel 1 by
+itself. `linux-hotspot roam` does the same thing on demand for people who are
+not running NetworkManager.
+
 ### Why not just use NetworkManager's own hotspot?
 
 GNOME Settings has a "Turn On Wi-Fi Hotspot" switch, and `nmcli device wifi

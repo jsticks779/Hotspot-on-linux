@@ -150,8 +150,9 @@ if [ -z "$SRC" ]; then
     trap 'rm -rf "$SRC"' EXIT
     say "downloading from github.com/$REPO ($REF)"
     mkdir -p "$SRC/bin" "$SRC/systemd" "$SRC/polkit" "$SRC/gnome-extension/$EXT_UUID"
+    mkdir -p "$SRC/networkmanager"
     for f in bin/linux-hotspot systemd/linux-hotspot.service systemd/linux-hotspot-resume.service \
-             polkit/49-linux-hotspot.rules \
+             polkit/49-linux-hotspot.rules networkmanager/50-linux-hotspot \
              "gnome-extension/$EXT_UUID/metadata.json" "gnome-extension/$EXT_UUID/extension.js"; do
         if ! curl -fsSL "$RAW/$f" -o "$SRC/$f"; then
             if ! dns_ok; then
@@ -302,6 +303,16 @@ if [ -d /etc/NetworkManager ]; then
 [keyfile]
 unmanaged-devices=interface-name:$AP_IFACE
 EOF
+    # Dispatcher hook: pause the hotspot while the client link changes, then
+    # bring it back on the new channel. Without it, a running hotspot pins the
+    # radio and you cannot join a network on a different channel at all.
+    if [ -d /etc/NetworkManager/dispatcher.d ] && [ -f "$SRC/networkmanager/50-linux-hotspot" ]; then
+        install -m 0755 -o root -g root \
+            "$SRC/networkmanager/50-linux-hotspot" \
+            /etc/NetworkManager/dispatcher.d/50-linux-hotspot
+        ok "the hotspot will step aside when you switch Wi-Fi networks"
+    fi
+
     if systemctl is-active NetworkManager >/dev/null 2>&1; then
         systemctl reload NetworkManager >/dev/null 2>&1 || true
     fi
