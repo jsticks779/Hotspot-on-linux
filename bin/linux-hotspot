@@ -185,6 +185,27 @@ chan_allows_ap() {
         END { if (!found) print "unknown" }'
 }
 
+# Networks in range that sit on a channel we are allowed to host on. Saved ones
+# come first, since joining those is a single click. Only consulted when we have
+# already failed, so the scan cost does not matter.
+hostable_networks_in_range() {
+    local phy=$1 allowed saved
+    command -v nmcli >/dev/null 2>&1 || return 0
+    allowed=$(ap_capable_channels "$phy")
+    [ -n "$allowed" ] || return 0
+    saved=$(nmcli -t -f NAME connection show 2>/dev/null)
+
+    nmcli -t -f SSID,CHAN,SIGNAL device wifi list 2>/dev/null |
+    awk -F: -v ok="$allowed" -v saved="$saved" '
+        BEGIN {
+            n = split(ok, a, " ");   for (i = 1; i <= n; i++) good[a[i]] = 1
+            m = split(saved, s, "\n"); for (i = 1; i <= m; i++) known[s[i]] = 1
+        }
+        $1 != "" && good[$2] && !seen[$1]++ {
+            printf "%s|%s|%s|%s\n", (known[$1] ? "saved" : "open"), $1, $2, $3
+        }' | sort -t'|' -k4,4nr | head -4
+}
+
 # Channels this card may actually start an access point on, right now.
 ap_capable_channels() {
     iw phy "$1" info 2>/dev/null | awk '
@@ -487,7 +508,23 @@ cmd_up() {
             warn "channels this card can host on: $usable"
         fi
         if [ "${uplink:-}" = "$sta" ]; then
-            die "so the hotspot cannot run while $sta is on channel $chan — connect to a network on one of those channels instead"
+            # Name the way out, rather than leaving it as an exercise.
+            local candidates tag ssid cch sig
+            candidates=$(hostable_networks_in_range "$phy")
+            if [ -n "$candidates" ]; then
+                warn "networks in range you could host on instead:"
+                while IFS='|' read -r tag ssid cch sig; do
+                    [ -n "$ssid" ] || continue
+                    if [ "$tag" = "saved" ]; then
+                        warn "  $ssid — channel $cch, ${sig}% (already saved: nmcli connection up \"$ssid\")"
+                    else
+                        warn "  $ssid — channel $cch, ${sig}%"
+                    fi
+                done <<EOF
+$candidates
+EOF
+            fi
+            die "the hotspot cannot run while $sta is on channel $chan"
         fi
         die "pick an allowed channel: sudo linux-hotspot config --channel N"
     fi
