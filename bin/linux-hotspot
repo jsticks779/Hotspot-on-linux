@@ -30,6 +30,7 @@ PASSPHRASE=""
 SECURITY="wpa2"          # wpa2 | wpa3 | mixed
 AP_IFACE="ap0"
 AP_MAC=""                # empty: inherit the card's MAC
+AP_PHY=""                # empty: auto (a second radio if there is one)
 STA_IFACE=""             # empty: auto-detect
 UPLINK_IFACE=""          # empty: auto-detect (the default route)
 CHANNEL=""               # empty: auto (forced to the client channel when sharing Wi-Fi)
@@ -77,7 +78,7 @@ load_conf() {
         val=${val#\"}; val=${val%\"}
         val=${val#\'}; val=${val%\'}
         case "$key" in
-            SSID|PASSPHRASE|SECURITY|AP_IFACE|AP_MAC|STA_IFACE|UPLINK_IFACE|\
+            SSID|PASSPHRASE|SECURITY|AP_IFACE|AP_MAC|AP_PHY|STA_IFACE|UPLINK_IFACE|\
             CHANNEL|COUNTRY|IPV4_NET|DHCP_FIRST|DHCP_LAST|DNS_SERVERS|HIDDEN)
                 printf -v "$key" '%s' "$val" ;;
         esac
@@ -102,6 +103,7 @@ SECURITY=$SECURITY
 #UPLINK_IFACE=eth0
 #AP_IFACE=ap0
 #AP_MAC=02:11:22:33:44:55
+#AP_PHY=phy1           # host on a second radio: any channel, always available
 #CHANNEL=6
 #COUNTRY=US
 #IPV4_NET=10.42.0
@@ -169,6 +171,30 @@ detect_country() {
 }
 
 phy_supports_ap() { iw phy "$1" info 2>/dev/null | grep -qE '^[[:space:]]*\* AP$'; }
+
+# Glob rather than `ls`: on systems where ls is a wrapper (eza and friends) it
+# decorates symlinks and the output stops being a plain list of names.
+wifi_phys() {
+    local p
+    for p in /sys/class/ieee80211/*; do
+        [ -e "$p" ] || continue
+        printf '%s\n' "${p##*/}"
+    done
+}
+
+# Which radio should host the hotspot? A radio other than the one carrying our
+# internet is worth far more than the built-in one: it has its own channel, so
+# the hotspot no longer has to follow the client link, and no regulator rule
+# about the client's channel applies to it. A USB dongle is enough.
+pick_ap_phy() {
+    local sta_phy=$1 p
+    if [ -n "$AP_PHY" ]; then echo "$AP_PHY"; return 0; fi
+    for p in $(wifi_phys); do
+        [ "$p" = "$sta_phy" ] && continue
+        if phy_supports_ap "$p"; then echo "$p"; return 0; fi
+    done
+    echo "$sta_phy"
+}
 
 # Regulatory rules decide more than which channels exist: many countries mark
 # 5 GHz channels "no IR" (no initiating radiation), meaning the card may *join*
@@ -453,11 +479,12 @@ cmd_up() {
     esac
     validate_credentials
 
-    local sta phy uplink chan hw freq mode
+    local sta phy ap_phy uplink chan hw freq mode
     sta=$(detect_sta) || die "no Wi-Fi interface found"
     [ -n "$sta" ] || die "no Wi-Fi interface found — is the card present and the driver loaded?"
     phy=$(sta_phy "$sta")
     [ -n "$phy" ] || die "cannot work out which radio $sta belongs to"
+    ap_phy=$(pick_ap_phy "$phy")
     uplink=$(detect_uplink)
 
     # If the only possible source of internet is the Wi-Fi link itself, it is
@@ -472,6 +499,17 @@ cmd_up() {
     # from. If the card is associated with a network — even when the internet
     # arrives over ethernet — the AP has to sit on that same channel, because
     # one radio cannot be tuned to two channels at once.
+    #
+    # Unless the hotspot has a radio of its own, in which case none of that
+    # applies and the channel is simply ours to pick.
+    if [ "$ap_phy" != "$phy" ]; then
+        chan=${CHANNEL:-6}
+        case "$chan" in
+            ''|*[!0-9]*) die "CHANNEL must be a number (got '$chan')" ;;
+        esac
+        if [ "$chan" -le 14 ]; then hw=g; else hw=a; fi
+        log "hosting on $ap_phy, its own radio — independent of $sta's channel"
+    else
     chan=$(sta_channel "$sta")
     if [ -n "$chan" ]; then
         freq=$(sta_freq "$sta")
@@ -487,6 +525,7 @@ cmd_up() {
         esac
         if [ "$chan" -le 14 ]; then hw=g; else hw=a; fi
     fi
+    fi
 
     if [ -z "$uplink" ]; then
         warn "no default route — the hotspot will work but has no internet to share"
@@ -499,18 +538,18 @@ cmd_up() {
 
     # Fail here, with an explanation, rather than letting hostapd retry four
     # times and die with "Could not select hw_mode and channel".
-    if [ "$(chan_allows_ap "$chan" "$phy")" = "no" ]; then
+    if [ "$(chan_allows_ap "$chan" "$ap_phy")" = "no" ]; then
         local usable
-        usable=$(ap_capable_channels "$phy")
-        warn "channel $chan is receive-only under $(detect_country "$phy") regulations —"
+        usable=$(ap_capable_channels "$ap_phy")
+        warn "channel $chan is receive-only under $(detect_country "$ap_phy") regulations —"
         warn "a card may join a network there, but not start one."
         if [ -n "$usable" ]; then
             warn "channels this card can host on: $usable"
         fi
-        if [ "${uplink:-}" = "$sta" ]; then
+        if [ "${uplink:-}" = "$sta" ] && [ "$ap_phy" = "$phy" ]; then
             # Name the way out, rather than leaving it as an exercise.
             local candidates tag ssid cch sig
-            candidates=$(hostable_networks_in_range "$phy")
+            candidates=$(hostable_networks_in_range "$ap_phy")
             if [ -n "$candidates" ]; then
                 warn "networks in range you could host on instead:"
                 while IFS='|' read -r tag ssid cch sig; do
@@ -529,11 +568,11 @@ EOF
         die "pick an allowed channel: sudo linux-hotspot config --channel N"
     fi
 
-    create_ap_iface "$phy"
+    create_ap_iface "$ap_phy"
     ip addr replace "$IPV4_NET.1/24" dev "$AP_IFACE"
     ip link set "$AP_IFACE" up >/dev/null 2>&1   # hostapd does this too; EBUSY here is harmless
 
-    write_hostapd_conf "$chan" "$hw" "$phy"
+    write_hostapd_conf "$chan" "$hw" "$ap_phy"
     if ! start_hostapd; then
         cmd_down >/dev/null 2>&1
         die "hostapd would not start on channel $chan ($hw) — debug with: hostapd -d $RUN_CONF"
@@ -796,39 +835,58 @@ cmd_doctor() {
     phy=$(sta_phy "$sta")
     ok "radio: $phy"
 
+    local ap_phy
+    ap_phy=$(pick_ap_phy "$phy")
+    if [ "$ap_phy" != "$phy" ]; then
+        ok "second radio $ap_phy will host the hotspot — any channel, always available"
+    elif [ "$(wifi_phys | wc -l)" -le 1 ]; then
+        echo "    ${C_DIM}one radio only, so the hotspot must share the client link's channel.${C_RESET}"
+        echo "    ${C_DIM}A second adapter (even a cheap USB one) removes that entirely.${C_RESET}"
+    fi
+
     if phy_supports_ap "$phy"; then
         ok "the card supports AP mode"
     else
         bad "this card does not advertise AP mode — a hotspot is not possible with this driver"
     fi
 
-    local combo
-    combo=$(phy_ap_combination "$phy")
-    if [ -n "$combo" ]; then
-        ok "the driver runs an AP alongside the client link"
-        if echo "$combo" | grep -q '#channels <= 1'; then
-            echo "    ${C_DIM}one channel only — the hotspot must sit on the client's channel${C_RESET}"
+    local chan hostchan combo
+    chan=$(sta_channel "$sta")
+
+    if [ "$ap_phy" = "$phy" ]; then
+        # One radio doing both jobs: the client link dictates the channel.
+        combo=$(phy_ap_combination "$phy")
+        if [ -n "$combo" ]; then
+            ok "the driver runs an AP alongside the client link"
+            if echo "$combo" | grep -q '#channels <= 1'; then
+                echo "    ${C_DIM}one channel only — the hotspot must sit on the client's channel${C_RESET}"
+            fi
+        else
+            meh "could not confirm AP + client at the same time (often still works — just try it)"
         fi
+        hostchan=$chan
     else
-        meh "could not confirm AP + client at the same time (often still works — just try it)"
+        # The hotspot has a radio to itself, so it picks its own channel and
+        # nothing the client link does can constrain it.
+        hostchan=${CHANNEL:-6}
+        if [ -n "$chan" ]; then
+            ok "client link is on channel $chan — the hotspot does not have to follow it"
+        fi
     fi
 
-    local chan
-    chan=$(sta_channel "$sta")
-    if [ -n "$chan" ]; then
-        ok "connected on channel $chan — the hotspot will use the same channel"
+    if [ -n "$hostchan" ]; then
+        [ "$ap_phy" = "$phy" ] && ok "connected on channel $chan — the hotspot will use the same channel"
         # Being allowed to *use* a channel and allowed to *start a network* on
         # it are different permissions in most countries.
-        case "$(chan_allows_ap "$chan" "$phy")" in
+        case "$(chan_allows_ap "$hostchan" "$ap_phy")" in
             yes)
-                ok "$(detect_country "$phy") regulations allow hosting on channel $chan" ;;
+                ok "$(detect_country "$ap_phy") regulations allow hosting on channel $hostchan" ;;
             no)
-                bad "channel $chan is receive-only under $(detect_country "$phy") regulations"
-                echo "    ${C_DIM}a card may join a network here, but not start one — the hotspot"
-                echo "    cannot run while this link is on channel $chan${C_RESET}"
-                echo "    ${C_DIM}channels this card can host on: $(ap_capable_channels "$phy")${C_RESET}" ;;
+                bad "channel $hostchan is receive-only under $(detect_country "$ap_phy") regulations"
+                echo "    ${C_DIM}a card may join a network here, but not start one${C_RESET}"
+                echo "    ${C_DIM}channels this radio can host on: $(ap_capable_channels "$ap_phy")${C_RESET}" ;;
             *)
-                meh "could not tell whether channel $chan permits hosting" ;;
+                meh "could not tell whether channel $hostchan permits hosting" ;;
         esac
     else
         meh "$sta is not connected; an uplink other than Wi-Fi is needed to share anything"
@@ -840,7 +898,13 @@ cmd_doctor() {
     uplink=$(detect_uplink)
     if [ -n "$uplink" ]; then
         ok "internet arrives over $uplink"
-        [ "$uplink" = "$sta" ] && echo "    → Wi-Fi to Wi-Fi: the AP is pinned to the client's channel"
+        if [ "$uplink" = "$sta" ]; then
+            if [ "$ap_phy" = "$phy" ]; then
+                echo "    ${C_DIM}→ Wi-Fi to Wi-Fi on one radio: the AP is pinned to the client's channel${C_RESET}"
+            else
+                echo "    ${C_DIM}→ Wi-Fi to Wi-Fi, but on separate radios — no channel constraint${C_RESET}"
+            fi
+        fi
     else
         meh "no default route — nothing to share right now"
     fi

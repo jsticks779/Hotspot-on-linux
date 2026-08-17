@@ -58,8 +58,21 @@ Known difficult:
 - Anything where `iw phy` does not list `* AP`.
 
 A cheap USB adapter with an `ath9k_htc`, `mt7601u` or `rtl8812au` chipset is the
-usual escape hatch, and it also removes the same-channel restriction because the
-hotspot then has its own radio.
+usual escape hatch — and it is also the answer to every channel restriction on
+this page, because the hotspot then has a radio to itself.
+
+**Two radios is the configuration that always works.** The tool notices a second
+AP-capable radio and hosts on it automatically, at which point the client link's
+channel and its regulatory flags stop mattering entirely:
+
+```
+✓ second radio phy1 will host the hotspot — any channel, always available
+✓ client link is on channel 3 — the hotspot does not have to follow it
+```
+
+Set `AP_PHY=` to choose between them, and `CHANNEL=` to pick the hotspot's own
+channel. Verified with `mac80211_hwsim` providing the second radio: the AP ran
+on phy1/channel 6 while the client link stayed on phy0/channel 3.
 
 ---
 

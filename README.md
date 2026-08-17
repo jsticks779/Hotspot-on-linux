@@ -134,6 +134,45 @@ card), that restriction disappears and you can pick any channel you like:
 sudo linux-hotspot config --channel 6
 ```
 
+### Making it work on any network: a second radio
+
+Everything above is the price of doing this with **one** radio. If you want the
+hotspot to run no matter which network you join — including 5 GHz channels the
+regulator marks receive-only — add a second Wi-Fi adapter. A cheap USB one is
+enough.
+
+With two radios the hotspot hosts on its own, and every restriction on this page
+disappears: no shared channel, no pausing when you switch networks, no
+regulator rule about the *client's* channel applying to the AP.
+
+It is detected automatically — plug it in and the hotspot moves to it:
+
+```
+✓ second radio phy1 will host the hotspot — any channel, always available
+✓ client link is on channel 3 — the hotspot does not have to follow it
+```
+
+Pin it explicitly if you have more than two, and pick its channel freely:
+
+```ini
+# /etc/linux-hotspot/hotspot.conf
+AP_PHY=phy1
+CHANNEL=6
+```
+
+Why a second radio and not a cleverer driver trick? Because the hardware says
+so. Ask your card what it will run at once:
+
+```
+$ iw phy phy0 info | grep -A2 "valid interface combinations"
+  * #{ managed } <= 1, #{ P2P-client, P2P-GO } <= 1, ...  total <= 3, #channels <= 2
+  * #{ managed } <= 1, #{ AP, P2P-client, P2P-GO } <= 1, ...  total <= 3, #channels <= 1
+```
+
+Client + **AP** is limited to one channel. (Client + a Wi-Fi Direct *group
+owner* may use two — which is why P2P-based sharing can escape this — but a GO
+cannot carry an arbitrary network name or password, so it makes a poor hotspot.)
+
 ### Joining a different Wi-Fi network while the hotspot runs
 
 The same rule has a consequence people hit immediately: **you cannot join a
@@ -172,6 +211,7 @@ SECURITY=wpa2          # wpa2 (works everywhere) | wpa3 | mixed
 #UPLINK_IFACE=eth0     # where the internet comes from (auto: the default route)
 #AP_IFACE=ap0          # the virtual interface to create
 #AP_MAC=02:11:22:33:44:55   # only if your driver refuses two interfaces sharing a MAC
+#AP_PHY=phy1           # host on a second radio: any channel, no restrictions
 #CHANNEL=6             # ignored when sharing Wi-Fi — that channel is not ours to pick
 #COUNTRY=US            # regulatory domain (auto-detected from your card)
 #IPV4_NET=10.42.0      # the hotspot subnet; the host takes .1
