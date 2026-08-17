@@ -82,6 +82,47 @@ Common causes:
 - **`unknown configuration item 'noscan'`** — you are on an older copy of this
   project. Current versions do not use `noscan`; update.
 
+### `channel N is receive-only under XX regulations`
+
+Your country's rules let the card *join* a network on that channel but never
+*start* one. The kernel marks such channels `no IR` — no initiating radiation —
+and hostapd refuses them outright:
+
+```
+Frequency 5180 (primary) not allowed for AP mode, flags: 0x30053 NO-IR
+Could not select hw_mode and channel. (-3)
+```
+
+Because the hotspot must share your client link's channel, this means **the
+hotspot cannot run while you are connected to a network on that channel.** It is
+a legal restriction, not a fault, and no setting bypasses it.
+
+See exactly which channels your card may host on:
+
+```bash
+sudo linux-hotspot doctor       # names them when the current channel is blocked
+iw phy phy0 info | grep -E "MHz \[" | grep -v "no IR"
+```
+
+In many countries the lower 5 GHz band (channels 36-64) and all DFS channels are
+receive-only, while 2.4 GHz and the upper 5 GHz band (149+) are free. A concrete
+example, Tanzania:
+
+```
+5170-5250 (ch 36-48)     PASSIVE-SCAN → no IR → AP forbidden
+5250-5730 (ch 52-144)    DFS          → no IR → AP forbidden
+5735-5815 (ch 149-163)   clean               → AP allowed
+2402-2482 (ch 1-13)      clean               → AP allowed
+```
+
+So the fix is to put your uplink on a channel that permits hosting — join the
+2.4 GHz network instead of its 5 GHz twin, or a 5 GHz network on channel 149 or
+above. Many routers broadcast both bands under the same or similar names.
+
+Note that the card may report a *different* regulatory domain from the system:
+`iw reg get` shows the global one, while `iw phy phy0 reg get` shows the card's
+own self-managed domain, which is the one actually enforced.
+
 ### The service failed at boot but works when started by hand
 
 The radio was not ready yet. The current service waits up to 25 seconds for the

@@ -148,5 +148,25 @@ Set yours explicitly:
 sudo linux-hotspot config --country TZ      # your own two-letter code
 ```
 
-When sharing a Wi-Fi connection this rarely matters, since the channel is
-inherited from a link that is already operating legally.
+When sharing a Wi-Fi connection the country code rarely needs setting by hand —
+but it decides something important: **which channels you may host on at all.**
+
+Most countries mark part of the 5 GHz band "no IR" (no initiating radiation):
+the card may join a network there but not create one. Since the hotspot has to
+share your client link's channel, being connected to such a network makes the
+hotspot impossible until you move to another one. `doctor` reports this and
+lists the channels your card can host on:
+
+```
+✗ channel 36 is receive-only under TZ regulations
+    channels this card can host on: 1 2 3 ... 11 12 13 149 153 157 161
+```
+
+Usually 2.4 GHz and the upper 5 GHz band (channel 149 and above) are free while
+channels 36-64 and all DFS channels are not. If your router broadcasts both
+bands, joining the 2.4 GHz one is the quickest way through.
+
+Cards with a *self-managed* regulatory domain (most iwlwifi) carry their own,
+which overrides the system setting — compare `iw reg get` with
+`iw phy phy0 reg get`. The tool reads the card's, because that is the one
+enforced.

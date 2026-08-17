@@ -148,15 +148,51 @@ sta_phy()     { iw dev "$1" info 2>/dev/null | awk '$1=="wiphy"{print "phy"$2}';
 sta_channel() { iw dev "$1" info 2>/dev/null | awk '$1=="channel"{print $2}'; }
 sta_freq()    { iw dev "$1" info 2>/dev/null | awk '$1=="channel"{gsub(/[()]/,"",$3); print $3}'; }
 
+# Cards with a self-managed regulatory domain (most iwlwifi) carry their own,
+# and it overrides the global one — it is what actually governs whether we may
+# transmit. Ask the radio first, and only fall back to the system-wide answer.
 detect_country() {
     if [ -n "$COUNTRY" ]; then echo "$COUNTRY"; return 0; fi
-    local c
-    c=$(iw reg get 2>/dev/null | awk '/^country/{gsub(":","",$2); print $2; exit}')
+
+    local phy="${1:-}" sta c=""
+    if [ -z "$phy" ]; then
+        sta=$(detect_sta) && phy=$(sta_phy "$sta")
+    fi
+    if [ -n "$phy" ]; then
+        c=$(iw phy "$phy" reg get 2>/dev/null | awk '/^country/{gsub(":","",$2); print $2; exit}')
+    fi
+    if [ -z "$c" ] || [ "$c" = "00" ]; then
+        c=$(iw reg get 2>/dev/null | awk '/^country/{gsub(":","",$2); print $2; exit}')
+    fi
     if [ -n "$c" ] && [ "$c" != "00" ]; then echo "$c"; return 0; fi
     echo "US"
 }
 
 phy_supports_ap() { iw phy "$1" info 2>/dev/null | grep -qE '^[[:space:]]*\* AP$'; }
+
+# Regulatory rules decide more than which channels exist: many countries mark
+# 5 GHz channels "no IR" (no initiating radiation), meaning the card may *join*
+# a network there but never *create* one. hostapd refuses those outright, so
+# check before we spend half a minute retrying.
+#   iw prints lines like:  * 5180.0 MHz [36] (22.0 dBm) (no IR)
+chan_allows_ap() {
+    local chan=$1 phy=$2
+    iw phy "$phy" info 2>/dev/null | awk -v want="[$chan]" '
+        $1 == "*" && $3 == "MHz" && $4 == want {
+            print ($0 ~ /no IR/ || $0 ~ /disabled/) ? "no" : "yes"
+            found = 1; exit
+        }
+        END { if (!found) print "unknown" }'
+}
+
+# Channels this card may actually start an access point on, right now.
+ap_capable_channels() {
+    iw phy "$1" info 2>/dev/null | awk '
+        $1 == "*" && $3 == "MHz" && $0 !~ /no IR/ && $0 !~ /disabled/ {
+            gsub(/[][]/, "", $4)
+            if ($4 != "") printf "%s ", $4
+        }'
+}
 
 # The "valid interface combinations" block says what the driver will run at the
 # same time. Each combination can wrap onto a second line, so glue them back
@@ -253,13 +289,13 @@ firewall_down() {
 
 # ----------------------------------------------------------------- hostapd ---
 write_hostapd_conf() {
-    local chan=$1 hw=$2
+    local chan=$1 hw=$2 phy=$3
     {
         echo "interface=$AP_IFACE"
         echo "driver=nl80211"
         echo "ctrl_interface=/run/hostapd"
         echo "ssid=$SSID"
-        echo "country_code=$(detect_country)"
+        echo "country_code=$(detect_country "$phy")"
         echo "ieee80211d=1"
         echo "hw_mode=$hw"
         echo "channel=$chan"
@@ -440,11 +476,27 @@ cmd_up() {
         mode="$uplink → wi-fi"
     fi
 
+    # Fail here, with an explanation, rather than letting hostapd retry four
+    # times and die with "Could not select hw_mode and channel".
+    if [ "$(chan_allows_ap "$chan" "$phy")" = "no" ]; then
+        local usable
+        usable=$(ap_capable_channels "$phy")
+        warn "channel $chan is receive-only under $(detect_country "$phy") regulations —"
+        warn "a card may join a network there, but not start one."
+        if [ -n "$usable" ]; then
+            warn "channels this card can host on: $usable"
+        fi
+        if [ "${uplink:-}" = "$sta" ]; then
+            die "so the hotspot cannot run while $sta is on channel $chan — connect to a network on one of those channels instead"
+        fi
+        die "pick an allowed channel: sudo linux-hotspot config --channel N"
+    fi
+
     create_ap_iface "$phy"
     ip addr replace "$IPV4_NET.1/24" dev "$AP_IFACE"
     ip link set "$AP_IFACE" up >/dev/null 2>&1   # hostapd does this too; EBUSY here is harmless
 
-    write_hostapd_conf "$chan" "$hw"
+    write_hostapd_conf "$chan" "$hw" "$phy"
     if ! start_hostapd; then
         cmd_down >/dev/null 2>&1
         die "hostapd would not start on channel $chan ($hw) — debug with: hostapd -d $RUN_CONF"
@@ -682,6 +734,19 @@ cmd_doctor() {
     chan=$(sta_channel "$sta")
     if [ -n "$chan" ]; then
         ok "connected on channel $chan — the hotspot will use the same channel"
+        # Being allowed to *use* a channel and allowed to *start a network* on
+        # it are different permissions in most countries.
+        case "$(chan_allows_ap "$chan" "$phy")" in
+            yes)
+                ok "$(detect_country "$phy") regulations allow hosting on channel $chan" ;;
+            no)
+                bad "channel $chan is receive-only under $(detect_country "$phy") regulations"
+                echo "    ${C_DIM}a card may join a network here, but not start one — the hotspot"
+                echo "    cannot run while this link is on channel $chan${C_RESET}"
+                echo "    ${C_DIM}channels this card can host on: $(ap_capable_channels "$phy")${C_RESET}" ;;
+            *)
+                meh "could not tell whether channel $chan permits hosting" ;;
+        esac
     else
         meh "$sta is not connected; an uplink other than Wi-Fi is needed to share anything"
     fi
