@@ -216,6 +216,71 @@ reduce the MTU on `ap0`.
 
 ---
 
+## Someone used GNOME Settings' hotspot switch and everything broke
+
+GNOME Settings has its own **Turn On Wi-Fi Hotspot** switch, and `nmcli device
+wifi hotspot` does the same thing. Neither has anything to do with this project.
+They convert your **client interface** into an access point, which:
+
+- disconnects you from the network whose internet you were sharing,
+- fights this project for the radio,
+- and — because GNOME reuses the same network name — produces something that
+  *looks* like your hotspot but carries no internet at all.
+
+The switch cannot be hidden, so the installer denies the two polkit actions
+behind it. Anyone flipping it now gets an error instead of a broken machine:
+
+```
+Error: Connection activation failed: Not authorized to share connections via wifi.
+```
+
+Check the guard is in place:
+
+```bash
+ls -l /etc/polkit-1/rules.d/50-linux-hotspot-no-nm-share.rules
+sudo linux-hotspot doctor      # reports it under "integration"
+```
+
+If a `Hotspot` profile was already created before the guard went in, `doctor`
+points it out. It cannot start while the guard is there, but you can tidy it up:
+
+```bash
+nmcli connection delete "Hotspot"
+```
+
+Want NetworkManager's hotspot back — reasonable if your uplink is ethernet
+rather than Wi-Fi? Delete the rules file, or install with `--allow-nm-hotspot`.
+
+> One quirk: even when denied, NetworkManager briefly disconnects the Wi-Fi
+> before discovering it is not allowed. The link comes back on its own, and the
+> dispatcher hook restarts the hotspot with it.
+
+---
+
+## The hotspot keeps dying because Wi-Fi reconnects to a blocked channel
+
+If your router broadcasts both bands, NetworkManager will usually pick whichever
+BSS is strongest — and that is often the 5 GHz one, on a channel the regulator
+will not let you host on. The hotspot then fails every time the machine
+reconnects, seemingly at random.
+
+Tell NetworkManager to prefer the band you can host on. Priority alone is not
+enough (right after a disconnect NM may only see one BSS in its scan), so the
+reliable fix is to stop the blocked profile from auto-joining:
+
+```bash
+# never auto-join the 5 GHz twin, but keep it joinable by hand
+sudo nmcli connection modify "MyNet_5G" connection.autoconnect no
+
+# and prefer the one that works
+sudo nmcli connection modify "MyNet" connection.autoconnect-priority 10
+```
+
+Undo at any time with `connection.autoconnect yes`. Use
+`sudo linux-hotspot doctor` to see which channels your card may host on.
+
+---
+
 ## I cannot join another Wi-Fi network while the hotspot is on
 
 You can see the network, the password is right, and it still will not connect.

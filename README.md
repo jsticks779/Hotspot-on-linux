@@ -203,7 +203,7 @@ Six moving parts, each doing one job:
 | `iptables`/`nft` | masquerades hotspot traffic out through your uplink |
 | `systemd` | starts, stops, survives reboot and suspend |
 | NM dispatcher | steps the hotspot aside while you switch networks |
-| polkit | lets you toggle it from the desktop without a password prompt |
+| polkit | lets you toggle it from the desktop without a password prompt, and blocks GNOME's own hotspot switch from hijacking the card |
 
 The full walkthrough — why each choice was made, and the driver quirks that
 forced them — is in **[docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)**.
@@ -225,6 +225,7 @@ Every failure this project has actually hit — and the fix — is written up in
 - "Device or resource busy" when starting
 - the hotspot works, then dies after suspend
 - you cannot join another Wi-Fi network while it is running
+- someone used GNOME Settings' hotspot switch and broke everything
 - GNOME shows a second "Wi-Fi (ap0)" device
 - the toggle asks for a password every time
 
@@ -247,6 +248,7 @@ install.sh / uninstall.sh            the one-command installer and its inverse
 systemd/linux-hotspot.service        start/stop/boot
 systemd/linux-hotspot-resume.service bring it back after suspend
 polkit/49-linux-hotspot.rules        toggle without a password prompt
+polkit/50-linux-hotspot-no-nm-share.rules  stop GNOME's own hotspot breaking it
 networkmanager/50-linux-hotspot      follow the client link onto new channels
 gnome-extension/                     the quick-settings tile
 docs/                                the long-form documentation

@@ -27,6 +27,7 @@ fi
 echo ":: removing files"
 rm -f /etc/systemd/system/linux-hotspot.service /etc/systemd/system/linux-hotspot-resume.service
 rm -f /etc/polkit-1/rules.d/49-linux-hotspot.rules
+rm -f /etc/polkit-1/rules.d/50-linux-hotspot-no-nm-share.rules
 rm -f /etc/NetworkManager/conf.d/99-linux-hotspot.conf
 rm -f /etc/NetworkManager/dispatcher.d/50-linux-hotspot
 rm -f /usr/local/bin/linux-hotspot /usr/local/bin/hotspot

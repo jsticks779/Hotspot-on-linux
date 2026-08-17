@@ -1,0 +1,27 @@
+// Block NetworkManager's own Wi-Fi hotspot, because it breaks this one.
+//
+// GNOME Settings has a "Turn On Wi-Fi Hotspot" switch, and nmcli has
+// `device wifi hotspot`. Both convert your *client* interface into an access
+// point — which disconnects you from the network whose internet you were
+// sharing, and fights this project for the radio. Worse, GNOME reuses the same
+// network name, so the result looks like your hotspot but carries no internet.
+//
+// There is no way to hide that switch, so instead we make it fail: these two
+// polkit actions gate NetworkManager's Wi-Fi sharing, and denying them stops
+// anyone flipping it by accident.
+//
+// This does NOT affect linux-hotspot, which drives hostapd directly on its own
+// ap0 interface and never asks NetworkManager to share anything.
+//
+// Installed to /etc/polkit-1/rules.d/50-linux-hotspot-no-nm-share.rules
+//
+// If you actually want NetworkManager's hotspot — reasonable when your uplink
+// is ethernet rather than Wi-Fi — just delete this file, or install with
+// `--allow-nm-hotspot`.
+
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.freedesktop.NetworkManager.wifi.share.protected" ||
+        action.id == "org.freedesktop.NetworkManager.wifi.share.open") {
+        return polkit.Result.NO;
+    }
+});

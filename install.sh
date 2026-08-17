@@ -49,6 +49,7 @@ SECURITY_ARG="${SECURITY:-wpa2}"
 WANT_EXTENSION=1
 WANT_START=1
 WANT_ENABLE=1
+BLOCK_NM_HOTSPOT=1
 
 usage() {
     cat <<EOF
@@ -58,6 +59,9 @@ ${C_BOLD}linux-hotspot installer${C_RESET}
   --password SECRET    8-63 characters
   --security MODE      wpa2 (default) | wpa3 | mixed
   --no-extension       skip the GNOME quick-settings toggle
+  --allow-nm-hotspot   leave GNOME Settings' own Wi-Fi hotspot switch working
+                       (it converts your client interface into an AP and drops
+                       the connection you are sharing — blocked by default)
   --no-start           install but do not start the hotspot now
   --no-enable          do not bring the hotspot back after a reboot
   -h, --help           this text
@@ -72,6 +76,7 @@ while [ $# -gt 0 ]; do
         --password)   PASS_ARG="${2:?--password needs a value}"; shift 2 ;;
         --security)   SECURITY_ARG="${2:?--security needs a value}"; shift 2 ;;
         --no-extension) WANT_EXTENSION=0; shift ;;
+        --allow-nm-hotspot) BLOCK_NM_HOTSPOT=0; shift ;;
         --no-start)   WANT_START=0; shift ;;
         --no-enable)  WANT_ENABLE=0; shift ;;
         -h|--help)    usage; exit 0 ;;
@@ -152,7 +157,8 @@ if [ -z "$SRC" ]; then
     mkdir -p "$SRC/bin" "$SRC/systemd" "$SRC/polkit" "$SRC/gnome-extension/$EXT_UUID"
     mkdir -p "$SRC/networkmanager"
     for f in bin/linux-hotspot systemd/linux-hotspot.service systemd/linux-hotspot-resume.service \
-             polkit/49-linux-hotspot.rules networkmanager/50-linux-hotspot \
+             polkit/49-linux-hotspot.rules polkit/50-linux-hotspot-no-nm-share.rules \
+             networkmanager/50-linux-hotspot \
              "gnome-extension/$EXT_UUID/metadata.json" "gnome-extension/$EXT_UUID/extension.js"; do
         if ! curl -fsSL "$RAW/$f" -o "$SRC/$f"; then
             if ! dns_ok; then
@@ -290,6 +296,18 @@ if [ -d /etc/polkit-1 ]; then
     install -d -m 0755 /etc/polkit-1/rules.d
     install -m 0644 "$SRC/polkit/49-linux-hotspot.rules" /etc/polkit-1/rules.d/49-linux-hotspot.rules
     ok "installed the polkit rule (toggle without a password prompt)"
+
+    # GNOME Settings' own hotspot switch turns the *client* interface into an
+    # AP, dropping the connection being shared — and it reuses the same network
+    # name, so it looks like this hotspot but carries no internet. The switch
+    # cannot be hidden, so deny the action behind it.
+    if [ "$BLOCK_NM_HOTSPOT" = 1 ] && [ -f "$SRC/polkit/50-linux-hotspot-no-nm-share.rules" ]; then
+        install -m 0644 "$SRC/polkit/50-linux-hotspot-no-nm-share.rules" \
+            /etc/polkit-1/rules.d/50-linux-hotspot-no-nm-share.rules
+        ok "blocked GNOME Settings' own hotspot switch (it would break this one)"
+    else
+        rm -f /etc/polkit-1/rules.d/50-linux-hotspot-no-nm-share.rules
+    fi
 fi
 
 # ---------------------------------------------------------- NetworkManager --
