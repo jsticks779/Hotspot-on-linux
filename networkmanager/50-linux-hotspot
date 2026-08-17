@@ -42,8 +42,13 @@ case "$ACTION" in
         fi
         ;;
     up)
-        if [ -e "$FLAG" ]; then
+        # Resume a hotspot we paused ourselves — and also retry one that is
+        # sitting in "failed". A common way to fail is joining a network on a
+        # channel the regulator will not let us host on; landing on a new
+        # network is exactly the moment that is worth another try.
+        if [ -e "$FLAG" ] || systemctl is-failed --quiet "$UNIT" 2>/dev/null; then
             rm -f "$FLAG"
+            systemctl reset-failed "$UNIT" >/dev/null 2>&1
             # Non-blocking, so a slow start cannot hold up the dispatcher queue.
             systemctl --no-block start "$UNIT" >/dev/null 2>&1
         fi
