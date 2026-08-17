@@ -21,6 +21,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const SERVICE = 'linux-hotspot.service';
 const SETTINGS_FILE = '/etc/linux-hotspot/hotspot.conf';
+const REASON_FILE = '/run/linux-hotspot.reason';
 const ICON = 'network-wireless-hotspot-symbolic';
 const POLL_SECONDS = 5;
 
@@ -42,6 +43,27 @@ function run(argv, onDone) {
         logError(e);
         onDone?.(false, '', `${e}`);
     }
+}
+
+/**
+ * Why the last start failed, in a sentence the user can act on. systemctl only
+ * reports that the unit failed; the useful detail (a regulator-blocked channel,
+ * a card with no AP mode) is written here by the tool itself.
+ */
+function failureReason() {
+    if (!GLib.file_test(REASON_FILE, GLib.FileTest.EXISTS))
+        return null;
+    try {
+        const [ok, bytes] = GLib.file_get_contents(REASON_FILE);
+        if (ok) {
+            const text = new TextDecoder().decode(bytes).trim();
+            if (text)
+                return text;
+        }
+    } catch (e) {
+        logError(e);
+    }
+    return null;
 }
 
 function readSettings() {
@@ -186,7 +208,8 @@ class HotspotToggle extends QuickMenuToggle {
             this.reactive = true;
             if (!ok && start) {
                 Main.notifyError('The hotspot did not start',
-                    err || 'Run “linux-hotspot doctor” or check: journalctl -u linux-hotspot -n 20');
+                    failureReason() || err ||
+                    'Run “linux-hotspot doctor” or check: journalctl -u linux-hotspot -n 20');
             }
             this._refresh();
         });

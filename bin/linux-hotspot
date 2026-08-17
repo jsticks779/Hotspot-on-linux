@@ -19,6 +19,7 @@ HOSTAPD_PID=/run/linux-hotspot-hostapd.pid
 DNSMASQ_PID=/run/linux-hotspot-dnsmasq.pid
 FORWARD_SAVE=/run/linux-hotspot.ip_forward
 UPLINK_SAVE=/run/linux-hotspot.uplink
+REASON=/run/linux-hotspot.reason   # last failure, for the desktop toggle to show
 LEASES=/var/lib/misc/linux-hotspot.leases
 NFT_TABLE=linux_hotspot
 EXT_UUID="linux-hotspot@jsticks779.github.io"
@@ -51,7 +52,14 @@ fi
 
 log()  { echo "${C_BLUE}::${C_RESET} $*"; logger -t linux-hotspot -- "$*" 2>/dev/null || true; }
 warn() { echo "${C_YELLOW}warning:${C_RESET} $*" >&2; logger -t linux-hotspot -- "warning: $*" 2>/dev/null || true; }
-die()  { echo "${C_RED}error:${C_RESET} $*" >&2; logger -t linux-hotspot -- "error: $*" 2>/dev/null || true; exit 1; }
+die()  {
+    echo "${C_RED}error:${C_RESET} $*" >&2
+    logger -t linux-hotspot -- "error: $*" 2>/dev/null || true
+    # Leave the reason where the quick-settings toggle can find it: a tile that
+    # simply refuses to switch on, with no explanation, looks broken.
+    printf '%s\n' "$*" > "$REASON" 2>/dev/null || true
+    exit 1
+}
 ok()   { echo "${C_GREEN}✓${C_RESET} $*"; }
 bad()  { echo "${C_RED}✗${C_RESET} $*"; }
 meh()  { echo "${C_YELLOW}!${C_RESET} $*"; }
@@ -563,7 +571,20 @@ cmd_up() {
 $candidates
 EOF
             fi
-            die "the hotspot cannot run while $sta is on channel $chan"
+            # Prefer the same router's other band — same password, same
+            # internet, so it is the least disruptive thing to suggest.
+            local hint="" cur base
+            cur=$(iw dev "$sta" link 2>/dev/null | awk '/^[[:space:]]*SSID:/{ $1=""; sub(/^ /, ""); print }')
+            base=$(printf '%s' "$cur" | sed -E 's/[ _-]?5 ?G(Hz)?$//I')
+            if [ -n "$base" ] && [ "$base" != "$cur" ]; then
+                hint=$(printf '%s\n' "$candidates" |
+                    awk -F'|' -v b="$base" '$2 == b { print $2" (channel "$3")"; exit }')
+            fi
+            [ -n "$hint" ] || hint=$(printf '%s\n' "$candidates" | awk -F'|' '$1=="saved"{print $2" (channel "$3")"; exit}')
+            if [ -n "$hint" ]; then
+                die "Channel $chan is receive-only here, so the hotspot cannot run on this network. Join $hint instead."
+            fi
+            die "Channel $chan is receive-only here, so the hotspot cannot run on this network. Join one on channel: $usable"
         fi
         die "pick an allowed channel: sudo linux-hotspot config --channel N"
     fi
@@ -593,6 +614,7 @@ EOF
 
     firewall_up "${uplink:-$sta}"
     local band; [ "$hw" = "g" ] && band="2.4 GHz" || band="5 GHz"
+    rm -f "$REASON"
     log "up: \"$SSID\" on channel $chan ($band), sharing $mode"
 }
 
@@ -672,7 +694,7 @@ cmd_roam() {
         # a different access point, or the same one after a real disconnect
         if [ -n "$now" ] && { [ "$now" != "$before" ] || [ "$saw_gap" = 1 ]; }; then
             sleep 2   # let the link settle before reading the channel off it
-            log "joined $(iw dev "$sta" link 2>/dev/null | awk '/^SSID:/{print $2}') on channel $(sta_channel "$sta")"
+            log "joined $(iw dev "$sta" link 2>/dev/null | awk '/^[[:space:]]*SSID:/{print $2}') on channel $(sta_channel "$sta")"
             hotspot_start
             return 0
         fi
